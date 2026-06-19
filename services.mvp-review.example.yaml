@@ -1,0 +1,40 @@
+﻿# Project-aligned MVP registry: three external microservice repository slots.
+# Together with this Python/AI orchestrator repository, the product has four repos total.
+services:
+  - name: user-service
+    application_name: user-api
+    repo_path: examples/toy-java-microservices/user-service
+    github_repo: https://github.com/example/user-service
+    build_tool: maven
+    test_cmd: mvn test
+    source_roots:
+      - src/main/java
+      - src/test/java
+    log_file: logs/user-service.log
+    base_url: http://localhost:8081
+
+  - name: order-service
+    application_name: order-api
+    repo_path: examples/toy-java-microservices/order-service
+    github_repo: https://github.com/example/order-service
+    build_tool: maven
+    test_cmd: mvn test
+    source_roots:
+      - src/main/java
+      - src/test/java
+    log_file: logs/order-service.log
+    base_url: http://localhost:8082
+
+  - name: payment-service
+    application_name: payment-api
+    repo_path: examples/toy-java-microservices/payment-service
+    github_repo: https://github.com/example/payment-service
+    build_tool: maven
+    test_cmd: mvn test
+    source_roots:
+      - src/main/java
+      - src/test/java
+    log_file: logs/payment-service.log
+    base_url: http://localhost:8083
+
+

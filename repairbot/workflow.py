@@ -1,0 +1,746 @@
+"""LangGraph orchestration for uploaded logs and external GitHub repositories."""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Literal, TypedDict
+from uuid import uuid4
+
+from .ingestion import UploadedLogIngestionService
+from .config import RepairBotSettings
+from .integrations.execution import FakePatchAgent, FakeTestRunner, PatchAgent, TestRunner
+from .integrations.github import FakeGitHubClient, GitHubClient, build_github_client
+from .integrations.jira import FakeJiraClient, JiraClient, build_jira_client
+from .langstack import HeuristicStructuredPlanner, StructuredPlanner, parse_incident_candidate
+from .persistence import InMemoryRepairPlatformRepository, RepairPlatformRepository
+from .platform_config import (
+    DEFAULT_CONFIG_PATH,
+    EffectiveRepairConfig,
+    find_project_config_path,
+    load_config_file,
+    merge_effective_config,
+    render_config_template,
+)
+from .platform_models import (
+    IncidentCandidate,
+    JiraTicketMetadata,
+    PullRequestMetadata,
+    RepairAttemptRecord,
+    RepairRunRecord,
+)
+from .redaction import redact_sensitive_text
+from .tracing import LangSmithTracingConfig
+
+
+class RepairWorkflowState(TypedDict, total=False):
+    run_id: str
+    repository_id: str
+    incident_id: str
+    uploaded_log_id: str
+    repo_url: str
+    repo_branch: str
+    service_name: str | None
+    module_path: str | None
+    language: str | None
+    build_system: str | None
+    test_cmd: str | None
+    jira_project: str | None
+    require_approval: bool
+    approval_granted: bool | None
+    log_path: str
+    clone_path: str
+    error_name: str
+    description: str
+    proposed_solution: str
+    likely_files: list[str]
+    jira_key: str
+    jira_ticket_url: str
+    plan_id: str
+    selected_hypothesis: str
+    branch_name: str
+    patch_summary: str
+    changed_files: list[str]
+    attempt_count: int
+    test_exit_code: int
+    test_output: str
+    tests_passed: bool
+    reflection: str
+    commit_sha: str
+    pull_request_url: str
+    langsmith_trace_url: str | None
+    status: str
+    current_step: str
+    operator_overrides: dict[str, Any]
+    effective_config: dict[str, Any]
+    config_source: str
+    model_provider: str
+    model_name: str
+    jira_issue_type: str
+    jira_mode: str
+    github_mode: str
+    target_branch: str
+
+
+@dataclass
+class WorkflowDependencies:
+    repository: RepairPlatformRepository
+    workspace_root: Path
+    github: GitHubClient = field(default_factory=FakeGitHubClient)
+    jira: JiraClient = field(default_factory=FakeJiraClient)
+    planner: StructuredPlanner = field(default_factory=HeuristicStructuredPlanner)
+    patch_agent: PatchAgent = field(default_factory=FakePatchAgent)
+    test_runner: TestRunner = field(default_factory=FakeTestRunner)
+    tracing: LangSmithTracingConfig = field(
+        default_factory=lambda: LangSmithTracingConfig(False, False, None)
+    )
+    use_interrupts: bool = False
+    max_attempts: int = 2
+    default_config_path: Path = DEFAULT_CONFIG_PATH
+
+
+def default_workflow_dependencies(
+    *,
+    repository: RepairPlatformRepository | None = None,
+    workspace_root: Path | None = None,
+) -> WorkflowDependencies:
+    return WorkflowDependencies(
+        repository=repository or InMemoryRepairPlatformRepository(),
+        workspace_root=(workspace_root or Path(".workspace")).resolve(),
+    )
+
+
+async def initial_workflow_state(
+    repository: RepairPlatformRepository,
+    run: RepairRunRecord,
+) -> RepairWorkflowState:
+    upload = await repository.get_log_upload(run.uploaded_log_id)
+    if upload is None:
+        raise KeyError(f"Missing uploaded log for run {run.run_id}")
+    return RepairWorkflowState(
+        run_id=run.run_id,
+        repository_id=run.repository_id,
+        incident_id=run.incident_id,
+        uploaded_log_id=run.uploaded_log_id,
+        repo_url=run.repo_url,
+        repo_branch=run.repo_branch,
+        service_name=run.service_name,
+        module_path=run.module_path,
+        language=run.language,
+        build_system=run.build_system,
+        test_cmd=run.test_cmd,
+        jira_project=run.jira_project,
+        operator_overrides=run.operator_overrides,
+        effective_config=run.effective_config,
+        config_source=run.config_source,
+        proposed_solution=run.proposed_solution,
+        require_approval=run.require_approval,
+        approval_granted=True if run.approval_status == "approved" else None,
+        log_path=upload.storage_path,
+        attempt_count=0,
+        status="queued",
+        current_step="created",
+        langsmith_trace_url=run.langsmith_trace_url,
+    )
+
+
+def build_repair_graph(
+    dependencies: WorkflowDependencies | None = None,
+    *,
+    checkpointer: Any | None = None,
+) -> Any:
+    """Build the explicit platform state graph without contacting external services."""
+
+    from langgraph.graph import END, START, StateGraph
+
+    deps = dependencies or default_workflow_dependencies()
+    builder = StateGraph(RepairWorkflowState)
+    builder.add_node("ingest_log", _bind(ingest_log, deps))
+    builder.add_node("clone_repository", _bind(clone_repository, deps))
+    builder.add_node("load_project_config", _bind(load_effective_project_config, deps))
+    builder.add_node("detect_project", _bind(detect_project, deps))
+    builder.add_node("analyze_log", _bind(analyze_log, deps))
+    builder.add_node("create_or_record_jira_ticket", _bind(create_or_record_jira_ticket, deps))
+    builder.add_node("plan_repair", _bind(plan_repair, deps))
+    builder.add_node("human_approval", _bind(human_approval, deps))
+    builder.add_node("patch_repository", _bind(patch_repository, deps))
+    builder.add_node("run_tests", _bind(run_tests, deps))
+    builder.add_node("reflect_or_retry", _bind(reflect_or_retry, deps))
+    builder.add_node("commit_and_open_pr", _bind(commit_and_open_pr, deps))
+    builder.add_node("finalize_run", _bind(finalize_run, deps))
+
+    builder.add_edge(START, "ingest_log")
+    builder.add_edge("ingest_log", "clone_repository")
+    builder.add_edge("clone_repository", "load_project_config")
+    builder.add_edge("load_project_config", "detect_project")
+    builder.add_edge("detect_project", "analyze_log")
+    builder.add_edge("analyze_log", "plan_repair")
+    builder.add_edge("plan_repair", "create_or_record_jira_ticket")
+    builder.add_edge("create_or_record_jira_ticket", "human_approval")
+    builder.add_conditional_edges(
+        "human_approval",
+        route_after_approval,
+        {"patch": "patch_repository", "finalize": "finalize_run", "wait": END},
+    )
+    builder.add_edge("patch_repository", "run_tests")
+    builder.add_edge("run_tests", "reflect_or_retry")
+    builder.add_conditional_edges(
+        "reflect_or_retry",
+        lambda state: route_after_reflection(state, deps.max_attempts),
+        {"retry": "patch_repository", "commit": "commit_and_open_pr", "finalize": "finalize_run"},
+    )
+    builder.add_edge("commit_and_open_pr", "finalize_run")
+    builder.add_edge("finalize_run", END)
+    return builder.compile(checkpointer=checkpointer)
+
+
+async def ingest_log(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "ingest_log")
+    path = Path(state["log_path"])
+    redacted = redact_sensitive_text(path.read_text(encoding="utf-8", errors="replace"))
+    path.write_text(redacted, encoding="utf-8")
+    return {"status": "running", "current_step": "ingest_log"}
+
+
+async def clone_repository(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "clone_repository")
+    bootstrap = _effective_config(state, deps, repo_config=None)
+    _configure_github_client(bootstrap, deps)
+    target_branch = bootstrap.github.default_base_branch
+    destination = deps.workspace_root / "runs" / state["run_id"] / "repo"
+    clone_path = await deps.github.clone_repository(
+        state["repo_url"], target_branch, destination
+    )
+    await deps.repository.update_repository(
+        state["repository_id"], clone_path=str(clone_path)
+    )
+    return {
+        "clone_path": str(clone_path),
+        "repo_branch": target_branch,
+        "effective_config": bootstrap.model_dump(mode="json"),
+        "config_source": _config_source(state, None, deps),
+        "current_step": "clone_repository",
+    }
+
+
+async def load_effective_project_config(
+    state: RepairWorkflowState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    await _progress(state, deps, "load_project_config")
+    config_path = find_project_config_path(
+        state["clone_path"], state.get("module_path")
+    )
+    repo_config = load_config_file(config_path) if config_path else None
+    effective = _effective_config(state, deps, repo_config=repo_config)
+    _configure_adapters(effective, deps)
+    deps.max_attempts = effective.model.max_attempts
+    configure_planner = getattr(deps.planner, "configure", None)
+    if callable(configure_planner):
+        configure_planner(
+            provider=effective.model.provider,
+            model_name=effective.model.model,
+            max_hypotheses=effective.model.max_hypotheses,
+        )
+    deps.tracing = LangSmithTracingConfig(
+        requested=effective.langsmith.enabled,
+        enabled=effective.langsmith.enabled and bool(os.getenv("LANGSMITH_API_KEY")),
+        project=effective.langsmith.project,
+        tags=tuple(effective.langsmith.tags),
+    )
+    source = _config_source(state, config_path, deps)
+    approval_status = (
+        "approved"
+        if state.get("approval_granted") is True
+        else "pending" if effective.repair.require_plan_approval else "not_required"
+    )
+    snapshot = effective.model_dump(mode="json")
+    run_changes = {
+        "config_source": source,
+        "effective_config": snapshot,
+        "model_provider": effective.model.provider,
+        "model_name": effective.model.model,
+        "jira_project": effective.jira.project_key,
+        "jira_issue_type": effective.jira.issue_type,
+        "jira_mode": effective.jira.mode,
+        "github_mode": effective.github.mode,
+        "repo_branch": effective.github.default_base_branch,
+        "target_branch": effective.github.default_base_branch,
+        "service_name": effective.service_name,
+        "module_path": effective.repair.module_path,
+        "language": effective.repair.language,
+        "build_system": effective.repair.build_system,
+        "test_cmd": effective.repair.test_command,
+        "require_approval": effective.repair.require_plan_approval,
+        "approval_status": approval_status,
+    }
+    await deps.repository.update_run(state["run_id"], **run_changes)
+    await deps.repository.update_incident(
+        state["incident_id"],
+        repo_branch=effective.github.default_base_branch,
+        target_branch=effective.github.default_base_branch,
+        service_name=effective.service_name,
+        module_path=effective.repair.module_path,
+    )
+    await deps.repository.update_repository(
+        state["repository_id"],
+        repo_branch=effective.github.default_base_branch,
+        service_name=effective.service_name,
+        module_path=effective.repair.module_path,
+    )
+    return {
+        **run_changes,
+        "jira_project": effective.jira.project_key,
+        "require_approval": effective.repair.require_plan_approval,
+        "effective_config": snapshot,
+        "config_source": source,
+        "current_step": "load_project_config",
+    }
+
+
+async def detect_project(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "detect_project")
+    repo_root = Path(state["clone_path"]).resolve()
+    module_root = (repo_root / (state.get("module_path") or ".")).resolve()
+    if not module_root.is_relative_to(repo_root):
+        raise ValueError("module_path escaped the cloned repository")
+    language = state.get("language")
+    build_system = state.get("build_system")
+    test_cmd = state.get("test_cmd")
+    if (module_root / "pom.xml").exists():
+        language, build_system = language or "java", build_system or "maven"
+        test_cmd = test_cmd or "mvn test"
+    elif (module_root / "build.gradle").exists() or (module_root / "build.gradle.kts").exists():
+        language, build_system = language or "java", build_system or "gradle"
+        test_cmd = test_cmd or "gradle test"
+    else:
+        language, build_system, test_cmd = language or "java", build_system or "maven", test_cmd or "mvn test"
+    await deps.repository.update_repository(
+        state["repository_id"],
+        detected_language=language,
+        detected_build_system=build_system,
+    )
+    await deps.repository.update_run(
+        state["run_id"], language=language, build_system=build_system, test_cmd=test_cmd
+    )
+    return {
+        "language": language,
+        "build_system": build_system,
+        "test_cmd": test_cmd,
+        "current_step": "detect_project",
+    }
+
+
+async def analyze_log(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "analyze_log")
+    text = Path(state["log_path"]).read_text(encoding="utf-8", errors="replace")
+    candidate = parse_incident_candidate(
+        text,
+        service_name=state.get("service_name"),
+        module_path=state.get("module_path"),
+    )
+    await deps.repository.update_incident(
+        state["incident_id"],
+        error_name=candidate.error_name,
+        description=candidate.description,
+        likely_files=candidate.likely_files,
+        status="running",
+    )
+    return {
+        "error_name": candidate.error_name,
+        "description": candidate.description,
+        "likely_files": candidate.likely_files,
+        "current_step": "analyze_log",
+    }
+
+
+async def create_or_record_jira_ticket(
+    state: RepairWorkflowState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    await _progress(state, deps, "create_or_record_jira_ticket")
+    config = EffectiveRepairConfig.model_validate(state["effective_config"])
+    template_values = {
+        "service_name": state.get("service_name") or "service",
+        "error_name": state["error_name"],
+        "description": state["description"],
+        "proposed_solution": state["proposed_solution"],
+        "selected_hypothesis": state["selected_hypothesis"],
+        "repo_url": state["repo_url"],
+        "target_branch": state.get("repo_branch") or "main",
+    }
+    title = redact_sensitive_text(
+        render_config_template(config.jira.title_template, template_values)
+    )
+    description = redact_sensitive_text(
+        render_config_template(config.jira.description_template, template_values)
+    )
+    solution = redact_sensitive_text(
+        render_config_template(config.jira.solution_template, template_values)
+    )
+    result = await deps.jira.create_or_record_ticket(
+        project_key=config.jira.project_key,
+        issue_type=config.jira.issue_type,
+        title=title,
+        description=description,
+        solution=solution,
+        incident_id=state["incident_id"],
+    )
+    await deps.repository.save_jira_ticket(
+        JiraTicketMetadata(
+            jira_ticket_id=f"jira_{result.jira_key.lower()}",
+            incident_id=state["incident_id"],
+            project_key=config.jira.project_key,
+            issue_type=config.jira.issue_type,
+            jira_key=result.jira_key,
+            jira_ticket_url=result.jira_ticket_url,
+            title=title,
+            description=description,
+            solution=solution,
+        )
+    )
+    await deps.repository.update_incident(
+        state["incident_id"], jira_ticket_url=result.jira_ticket_url
+    )
+    await deps.repository.update_run(
+        state["run_id"], jira_ticket_url=result.jira_ticket_url
+    )
+    return {
+        "jira_key": result.jira_key,
+        "jira_ticket_url": result.jira_ticket_url,
+        "current_step": "create_or_record_jira_ticket",
+    }
+
+
+async def plan_repair(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "plan_repair")
+    candidate = IncidentCandidate(
+        error_name=state["error_name"],
+        description=state["description"],
+        likely_files=state.get("likely_files", []),
+        service_name=state.get("service_name"),
+        module_path=state.get("module_path"),
+    )
+    plan = await deps.planner.create_plan(
+        run_id=state["run_id"],
+        incident_id=state["incident_id"],
+        incident=candidate,
+        repo_path=Path(state["clone_path"]),
+        test_command=state["test_cmd"],
+        tracing=deps.tracing,
+    )
+    proposed_solution = _proposed_solution(plan)
+    await deps.repository.save_plan(plan)
+    await deps.repository.update_incident(
+        state["incident_id"],
+        plan_id=plan.plan_id,
+        selected_hypothesis=plan.selected_hypothesis,
+        proposed_solution=proposed_solution,
+    )
+    await deps.repository.update_run(
+        state["run_id"],
+        plan_id=plan.plan_id,
+        selected_hypothesis=plan.selected_hypothesis,
+        proposed_solution=proposed_solution,
+    )
+    return {
+        "plan_id": plan.plan_id,
+        "selected_hypothesis": plan.selected_hypothesis,
+        "proposed_solution": proposed_solution,
+        "current_step": "plan_repair",
+    }
+
+
+async def human_approval(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "human_approval")
+    if not state.get("require_approval"):
+        return {"approval_granted": True, "current_step": "human_approval"}
+    decision = state.get("approval_granted")
+    if decision is None and deps.use_interrupts:
+        from langgraph.types import interrupt
+
+        response = interrupt(
+            {
+                "run_id": state["run_id"],
+                "plan_id": state["plan_id"],
+                "question": "Approve this repair plan?",
+            }
+        )
+        decision = bool(response)
+    if decision is None:
+        await deps.repository.update_run(
+            state["run_id"],
+            status="waiting_for_approval",
+            current_step="human_approval",
+            approval_status="pending",
+        )
+        await deps.repository.update_incident(
+            state["incident_id"], status="waiting_for_approval"
+        )
+        return {
+            "status": "waiting_for_approval",
+            "current_step": "human_approval",
+            "approval_granted": None,
+        }
+    if not decision:
+        await deps.repository.update_run(
+            state["run_id"], status="denied", approval_status="denied"
+        )
+        return {"status": "denied", "approval_granted": False}
+    await deps.repository.update_run(
+        state["run_id"], status="approved", approval_status="approved"
+    )
+    return {"status": "approved", "approval_granted": True}
+
+
+def route_after_approval(state: RepairWorkflowState) -> Literal["patch", "finalize", "wait"]:
+    if state.get("status") == "waiting_for_approval":
+        return "wait"
+    if state.get("approval_granted") is False:
+        return "finalize"
+    return "patch"
+
+
+async def patch_repository(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "patch_repository")
+    branch_name = state.get("branch_name") or _branch_name(state)
+    result = await deps.patch_agent.apply_patch(
+        repo_path=Path(state["clone_path"]),
+        module_path=state.get("module_path"),
+        branch_name=branch_name,
+        selected_hypothesis=state["selected_hypothesis"],
+    )
+    await deps.repository.update_run(state["run_id"], branch_name=result.branch_name)
+    await deps.repository.update_incident(
+        state["incident_id"], branch_name=result.branch_name
+    )
+    return {
+        "branch_name": result.branch_name,
+        "patch_summary": redact_sensitive_text(result.summary),
+        "changed_files": result.changed_files,
+        "current_step": "patch_repository",
+    }
+
+
+async def run_tests(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "run_tests")
+    result = await deps.test_runner.run_tests(
+        repo_path=Path(state["clone_path"]),
+        module_path=state.get("module_path"),
+        command=state["test_cmd"],
+    )
+    return {
+        "attempt_count": state.get("attempt_count", 0) + 1,
+        "test_exit_code": result.exit_code,
+        "test_output": redact_sensitive_text(result.output)[-20_000:],
+        "tests_passed": result.passed,
+        "current_step": "run_tests",
+    }
+
+
+async def reflect_or_retry(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    await _progress(state, deps, "reflect_or_retry")
+    if state["tests_passed"]:
+        reflection = "Tests passed; proceed to commit and pull-request metadata."
+    elif state["attempt_count"] < deps.max_attempts:
+        reflection = "Tests failed; retry the selected hypothesis with the captured test evidence."
+    else:
+        reflection = "Tests still fail after the allowed attempts; stop without opening a pull request."
+    await deps.repository.save_attempt(
+        RepairAttemptRecord(
+            repair_attempt_id=f"attempt_{uuid4().hex}",
+            run_id=state["run_id"],
+            attempt_number=state["attempt_count"],
+            hypothesis=state["selected_hypothesis"],
+            patch_summary=state["patch_summary"],
+            test_command=state["test_cmd"],
+            test_exit_code=state["test_exit_code"],
+            test_output=state["test_output"],
+            tests_passed=state["tests_passed"],
+            reflection=reflection,
+        )
+    )
+    return {"reflection": reflection, "current_step": "reflect_or_retry"}
+
+
+def route_after_reflection(
+    state: RepairWorkflowState, max_attempts: int
+) -> Literal["retry", "commit", "finalize"]:
+    if state.get("tests_passed"):
+        return "commit"
+    if state.get("attempt_count", 0) < max_attempts:
+        return "retry"
+    return "finalize"
+
+
+async def commit_and_open_pr(
+    state: RepairWorkflowState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    await _progress(state, deps, "commit_and_open_pr")
+    config = EffectiveRepairConfig.model_validate(state["effective_config"])
+    if not config.github.create_pull_request:
+        return {
+            "current_step": "commit_and_open_pr",
+            "reflection": "Pull-request creation disabled by effective configuration.",
+        }
+    result = await deps.github.commit_and_open_pull_request(
+        repo_url=state["repo_url"],
+        repo_path=Path(state["clone_path"]),
+        base_branch=state.get("repo_branch") or "main",
+        branch_name=state["branch_name"],
+        title=f"Repair {state['error_name']}",
+        body=(
+            "AI-generated repair scaffold; human review is required.\n\n"
+            f"Hypothesis: {state['selected_hypothesis']}\n"
+            f"Tests: {state['test_cmd']}"
+        ),
+    )
+    await deps.repository.save_pull_request(
+        PullRequestMetadata(
+            pull_request_id=f"pr_{uuid4().hex}",
+            incident_id=state["incident_id"],
+            repo_url=state["repo_url"],
+            branch_name=result.branch_name,
+            base_branch=state.get("repo_branch") or "main",
+            commit_sha=result.commit_sha,
+            pull_request_url=result.pull_request_url,
+        )
+    )
+    if config.jira.update_pr_link:
+        await deps.jira.update_ticket_with_pull_request(
+            jira_key=state["jira_key"],
+            pull_request_url=result.pull_request_url,
+        )
+        await deps.repository.update_jira_ticket_with_pull_request(
+            state["jira_key"], result.pull_request_url
+        )
+    changes = {
+        "branch_name": result.branch_name,
+        "commit_sha": result.commit_sha,
+        "pull_request_url": result.pull_request_url,
+    }
+    await deps.repository.update_run(state["run_id"], **changes)
+    await deps.repository.update_incident(state["incident_id"], **changes)
+    return {**changes, "current_step": "commit_and_open_pr"}
+
+
+async def finalize_run(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
+    if state.get("status") == "denied":
+        status = "denied"
+    elif state.get("tests_passed") is False:
+        status = "failed"
+    else:
+        status = "completed"
+    changes = {
+        "status": status,
+        "current_step": "finalize_run",
+        "langsmith_trace_url": state.get("langsmith_trace_url"),
+    }
+    await deps.repository.update_run(state["run_id"], **changes)
+    await deps.repository.update_incident(
+        state["incident_id"],
+        status=status,
+        langsmith_trace_url=state.get("langsmith_trace_url"),
+    )
+    return changes
+
+
+async def _progress(
+    state: RepairWorkflowState, deps: WorkflowDependencies, step: str
+) -> None:
+    await deps.repository.update_run(
+        state["run_id"], status="running", current_step=step
+    )
+
+
+def _bind(function: Any, dependencies: WorkflowDependencies) -> Any:
+    async def bound(state: RepairWorkflowState) -> dict[str, Any]:
+        return await function(state, dependencies)
+
+    bound.__name__ = function.__name__
+    return bound
+
+
+def _branch_name(state: RepairWorkflowState) -> str:
+    service = re.sub(
+        r"[^a-z0-9._-]+", "-", (state.get("service_name") or "service").lower()
+    ).strip("-.")
+    return f"ai-fix/{service or 'service'}/{state['run_id'][-12:]}"
+
+
+def _proposed_solution(plan: Any) -> str:
+    edits = "; ".join(plan.planned_edits) or "Apply the smallest evidence-led code change."
+    tests = "; ".join(plan.planned_tests) or "Run the configured regression tests."
+    return redact_sensitive_text(
+        f"Address the selected hypothesis: {plan.selected_hypothesis}. "
+        f"Planned change: {edits} Verification: {tests}"
+    )[:4000]
+
+
+def _effective_config(
+    state: RepairWorkflowState,
+    deps: WorkflowDependencies,
+    *,
+    repo_config: Any | None,
+) -> EffectiveRepairConfig:
+    default_config = (
+        load_config_file(deps.default_config_path)
+        if deps.default_config_path.is_file()
+        else None
+    )
+    env_settings = RepairBotSettings.from_env(dotenv_path=None)
+    return merge_effective_config(
+        state.get("operator_overrides", {}),
+        repo_config,
+        default_config,
+        env_settings,
+    )
+
+
+def _configure_github_client(
+    config: EffectiveRepairConfig, deps: WorkflowDependencies
+) -> None:
+    if config.github.mode == "fake":
+        if not isinstance(deps.github, FakeGitHubClient):
+            deps.github = build_github_client("fake")
+        return
+    deps.github = build_github_client("real")
+
+
+def _configure_adapters(
+    config: EffectiveRepairConfig, deps: WorkflowDependencies
+) -> None:
+    _configure_github_client(config, deps)
+    if config.jira.mode == "fake":
+        if not isinstance(deps.jira, FakeJiraClient):
+            deps.jira = build_jira_client("fake")
+        return
+    deps.jira = build_jira_client("real")
+
+
+def _config_source(
+    state: RepairWorkflowState,
+    repo_config_path: Path | None,
+    deps: WorkflowDependencies,
+) -> str:
+    sources: list[str] = []
+    if state.get("operator_overrides"):
+        sources.append("operator-request")
+    if repo_config_path is not None:
+        sources.append(f"repo:{repo_config_path.name}")
+    if deps.default_config_path.is_file():
+        sources.append(f"default:{deps.default_config_path.name}")
+    sources.append("environment/fallback")
+    return " > ".join(sources)
+
+
+__all__ = [
+    "UploadedLogIngestionService",
+    "WorkflowDependencies",
+    "build_repair_graph",
+    "default_workflow_dependencies",
+    "initial_workflow_state",
+    "load_effective_project_config",
+    "route_after_approval",
+    "route_after_reflection",
+]

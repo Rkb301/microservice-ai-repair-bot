@@ -1,0 +1,5 @@
+server:
+  port: 8084
+service:
+  name: inventory-service
+  data: in-memory-only
