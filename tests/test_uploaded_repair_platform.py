@@ -106,8 +106,8 @@ def test_api_accepts_uploaded_log_and_github_url_without_external_calls(tmp_path
             body = detail.json()
             assert body["incident"]["error_name"] == "NullPointerException"
             assert body["incident"]["proposed_solution"]
-            assert body["incident"]["jira_ticket_url"].startswith("https://example.invalid/")
-            assert body["incident"]["pull_request_url"].startswith("https://example.invalid/")
+            assert body["incident"]["jira_ticket_url"].startswith("https://jira.local/")
+            assert body["incident"]["pull_request_url"].startswith("https://github.local/")
             assert body["incident"]["repo_url"] == "https://github.com/example/order-service"
             assert body["run"]["proposed_solution"] == body["incident"]["proposed_solution"]
             assert body["run"]["selected_hypothesis"]
@@ -147,6 +147,14 @@ def test_plan_approval_endpoint_resumes_waiting_graph(tmp_path: Path) -> None:
             )
             assert approved.status_code == 200, approved.text
             assert approved.json()["status"] == "completed"
+
+            detail = await client.get(
+                f"/api/repair-runs/{created.json()['run_id']}"
+            )
+            assert detail.status_code == 200
+            assert detail.json()["jira"]["pull_request_url"] == detail.json()[
+                "pull_request"
+            ]["pull_request_url"]
 
     asyncio.run(scenario())
 
@@ -262,9 +270,9 @@ def test_fake_jira_stores_ticket_content_and_pr_backlink() -> None:
 
         await jira.update_ticket_with_pull_request(
             jira_key=created.jira_key,
-            pull_request_url="https://example.invalid/github/pull/project",
+            pull_request_url="https://github.local/example/order-service/pull/1",
         )
-        assert ticket.pull_request_url == "https://example.invalid/github/pull/project"
+        assert ticket.pull_request_url == "https://github.local/example/order-service/pull/1"
 
     asyncio.run(scenario())
 

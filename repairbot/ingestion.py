@@ -43,6 +43,8 @@ class UploadedLogIngestionService:
         repository_id = f"repo_{uuid4().hex}"
         uploaded_log_id = f"log_{uuid4().hex}"
         incident_id = f"inc_{uuid4().hex}"
+        local_trace_id = f"trace_{run_id.removeprefix('run_')}"
+        local_trace_url = f"langsmith://local-demo/{run_id}"
         run_root = self.workspace_root / "runs" / run_id
         upload_dir = run_root / "uploads"
         upload_dir.mkdir(parents=True, exist_ok=False)
@@ -106,6 +108,12 @@ class UploadedLogIngestionService:
             build_system=request.build_system,
             test_cmd=request.test_cmd,
             jira_project=request.jira_project,
+            github_mode=request.github_mode or "fake",
+            execution_mode=request.execution_mode or "fake",
+            allow_network=request.allow_network,
+            dry_run=True if request.dry_run is None else request.dry_run,
+            local_trace_id=local_trace_id,
+            langsmith_trace_url=local_trace_url,
             operator_overrides=request.model_dump(
                 mode="python", exclude_none=True, exclude={"repo_url"}
             ),

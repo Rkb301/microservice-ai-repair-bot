@@ -1,0 +1,5 @@
+2026-06-20T09:17:44.772Z ERROR [payment-service] trace_id=demo-payment-001 request_id=req-payment-001 POST /payments/charge rejected
+java.lang.IllegalArgumentException: amount must be positive
+    at com.example.payment.PaymentServiceApp.charge(PaymentServiceApp.java:39)
+    at com.example.payment.PaymentServiceApp.handlePayments(PaymentServiceApp.java:20)
+2026-06-20T09:17:44.775Z INFO  [payment-service] trace_id=demo-payment-001 response_status=400 duration_ms=4

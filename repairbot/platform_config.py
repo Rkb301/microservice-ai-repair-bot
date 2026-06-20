@@ -131,6 +131,7 @@ class RepairBehaviorConfig(BaseModel):
 
     require_plan_approval: bool = True
     dry_run_default: bool = True
+    execution_mode: Literal["fake", "real"] = "fake"
     test_command: str = "mvn test"
     build_system: str = "maven"
     language: str = "java"
@@ -352,8 +353,11 @@ def _operator_layer(request: BaseModel | Mapping[str, Any] | None) -> dict[str, 
         layer.setdefault("model", {})["model"] = model
     mappings = {
         "repo_branch": ("github", "default_base_branch"),
+        "github_mode": ("github", "mode"),
         "test_cmd": ("repair", "test_command"),
         "require_approval": ("repair", "require_plan_approval"),
+        "execution_mode": ("repair", "execution_mode"),
+        "dry_run": ("repair", "dry_run_default"),
         "module_path": ("repair", "module_path"),
         "language": ("repair", "language"),
         "build_system": ("repair", "build_system"),

@@ -11,9 +11,21 @@ from uuid import uuid4
 
 from .ingestion import UploadedLogIngestionService
 from .config import RepairBotSettings
-from .integrations.execution import FakePatchAgent, FakeTestRunner, PatchAgent, TestRunner
-from .integrations.github import FakeGitHubClient, GitHubClient, build_github_client
-from .integrations.jira import FakeJiraClient, JiraClient, build_jira_client
+from .integrations.execution import (
+    FakePatchAgent,
+    FakeTestRunner,
+    FilePatchAgent,
+    PatchAgent,
+    SubprocessTestRunner,
+    TestRunner,
+)
+from .integrations.github import (
+    FakeGitHubClient,
+    GitHubClient,
+    RealGitHubClient,
+    build_github_client,
+)
+from .integrations.jira import FakeJiraClient, JiraClient, RealJiraClient, build_jira_client
 from .langstack import HeuristicStructuredPlanner, StructuredPlanner, parse_incident_candidate
 from .persistence import InMemoryRepairPlatformRepository, RepairPlatformRepository
 from .platform_config import (
@@ -81,6 +93,9 @@ class RepairWorkflowState(TypedDict, total=False):
     jira_issue_type: str
     jira_mode: str
     github_mode: str
+    execution_mode: str
+    allow_network: bool
+    dry_run: bool
     target_branch: str
 
 
@@ -137,6 +152,9 @@ async def initial_workflow_state(
         config_source=run.config_source,
         proposed_solution=run.proposed_solution,
         require_approval=run.require_approval,
+        execution_mode=run.execution_mode,
+        allow_network=run.allow_network,
+        dry_run=run.dry_run,
         approval_granted=True if run.approval_status == "approved" else None,
         log_path=upload.storage_path,
         attempt_count=0,
@@ -207,7 +225,11 @@ async def ingest_log(state: RepairWorkflowState, deps: WorkflowDependencies) -> 
 async def clone_repository(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
     await _progress(state, deps, "clone_repository")
     bootstrap = _effective_config(state, deps, repo_config=None)
-    _configure_github_client(bootstrap, deps)
+    _configure_github_client(
+        bootstrap,
+        deps,
+        allow_network=bool(state.get("allow_network")),
+    )
     target_branch = bootstrap.github.default_base_branch
     destination = deps.workspace_root / "runs" / state["run_id"] / "repo"
     clone_path = await deps.github.clone_repository(
@@ -234,7 +256,11 @@ async def load_effective_project_config(
     )
     repo_config = load_config_file(config_path) if config_path else None
     effective = _effective_config(state, deps, repo_config=repo_config)
-    _configure_adapters(effective, deps)
+    _configure_adapters(
+        effective,
+        deps,
+        allow_network=bool(state.get("allow_network")),
+    )
     deps.max_attempts = effective.model.max_attempts
     configure_planner = getattr(deps.planner, "configure", None)
     if callable(configure_planner):
@@ -265,6 +291,11 @@ async def load_effective_project_config(
         "jira_issue_type": effective.jira.issue_type,
         "jira_mode": effective.jira.mode,
         "github_mode": effective.github.mode,
+        "execution_mode": effective.repair.execution_mode,
+        "dry_run": effective.repair.dry_run_default,
+        "langsmith_enabled": deps.tracing.enabled,
+        "langsmith_project": effective.langsmith.project,
+        "langsmith_tags": list(effective.langsmith.tags),
         "repo_branch": effective.github.default_base_branch,
         "target_branch": effective.github.default_base_branch,
         "service_name": effective.service_name,
@@ -385,6 +416,9 @@ async def create_or_record_jira_ticket(
         description=description,
         solution=solution,
         incident_id=state["incident_id"],
+        service_name=state.get("service_name"),
+        repo_url=state.get("repo_url"),
+        run_id=state.get("run_id"),
     )
     await deps.repository.save_jira_ticket(
         JiraTicketMetadata(
@@ -504,11 +538,18 @@ def route_after_approval(state: RepairWorkflowState) -> Literal["patch", "finali
 async def patch_repository(state: RepairWorkflowState, deps: WorkflowDependencies) -> dict[str, Any]:
     await _progress(state, deps, "patch_repository")
     branch_name = state.get("branch_name") or _branch_name(state)
+    await deps.github.create_branch(
+        repo_path=Path(state["clone_path"]),
+        base_branch=state.get("repo_branch") or "main",
+        branch_name=branch_name,
+    )
     result = await deps.patch_agent.apply_patch(
         repo_path=Path(state["clone_path"]),
         module_path=state.get("module_path"),
         branch_name=branch_name,
         selected_hypothesis=state["selected_hypothesis"],
+        service_name=state.get("service_name"),
+        error_name=state.get("error_name"),
     )
     await deps.repository.update_run(state["run_id"], branch_name=result.branch_name)
     await deps.repository.update_incident(
@@ -553,6 +594,7 @@ async def reflect_or_retry(state: RepairWorkflowState, deps: WorkflowDependencie
             attempt_number=state["attempt_count"],
             hypothesis=state["selected_hypothesis"],
             patch_summary=state["patch_summary"],
+            changed_files=state.get("changed_files", []),
             test_command=state["test_cmd"],
             test_exit_code=state["test_exit_code"],
             test_output=state["test_output"],
@@ -568,6 +610,8 @@ def route_after_reflection(
 ) -> Literal["retry", "commit", "finalize"]:
     if state.get("tests_passed"):
         return "commit"
+    if state.get("execution_mode") == "real":
+        return "finalize"
     if state.get("attempt_count", 0) < max_attempts:
         return "retry"
     return "finalize"
@@ -578,22 +622,31 @@ async def commit_and_open_pr(
 ) -> dict[str, Any]:
     await _progress(state, deps, "commit_and_open_pr")
     config = EffectiveRepairConfig.model_validate(state["effective_config"])
+    if state.get("dry_run") and (
+        config.github.mode == "real" or config.repair.execution_mode == "real"
+    ):
+        return {
+            "current_step": "commit_and_open_pr",
+            "reflection": "Dry run completed after patch and tests; commit, push, and pull request were skipped.",
+        }
     if not config.github.create_pull_request:
         return {
             "current_step": "commit_and_open_pr",
             "reflection": "Pull-request creation disabled by effective configuration.",
         }
+    pull_request_title = f"Repair {state['error_name']}"
     result = await deps.github.commit_and_open_pull_request(
         repo_url=state["repo_url"],
         repo_path=Path(state["clone_path"]),
         base_branch=state.get("repo_branch") or "main",
         branch_name=state["branch_name"],
-        title=f"Repair {state['error_name']}",
+        title=pull_request_title,
         body=(
             "AI-generated repair scaffold; human review is required.\n\n"
             f"Hypothesis: {state['selected_hypothesis']}\n"
             f"Tests: {state['test_cmd']}"
         ),
+        changed_files=state.get("changed_files", []),
     )
     await deps.repository.save_pull_request(
         PullRequestMetadata(
@@ -602,6 +655,7 @@ async def commit_and_open_pr(
             repo_url=state["repo_url"],
             branch_name=result.branch_name,
             base_branch=state.get("repo_branch") or "main",
+            title=pull_request_title,
             commit_sha=result.commit_sha,
             pull_request_url=result.pull_request_url,
         )
@@ -698,24 +752,52 @@ def _effective_config(
 
 
 def _configure_github_client(
-    config: EffectiveRepairConfig, deps: WorkflowDependencies
+    config: EffectiveRepairConfig,
+    deps: WorkflowDependencies,
+    *,
+    allow_network: bool,
 ) -> None:
     if config.github.mode == "fake":
         if not isinstance(deps.github, FakeGitHubClient):
             deps.github = build_github_client("fake")
         return
-    deps.github = build_github_client("real")
+    if not allow_network:
+        raise RuntimeError(
+            "Real GitHub mode requires an explicit runtime network allowance"
+        )
+    if not isinstance(deps.github, RealGitHubClient):
+        deps.github = build_github_client("real")
 
 
 def _configure_adapters(
-    config: EffectiveRepairConfig, deps: WorkflowDependencies
+    config: EffectiveRepairConfig,
+    deps: WorkflowDependencies,
+    *,
+    allow_network: bool,
 ) -> None:
-    _configure_github_client(config, deps)
+    _configure_github_client(config, deps, allow_network=allow_network)
+    if config.repair.execution_mode == "real":
+        if not allow_network:
+            raise RuntimeError(
+                "Real patch/test mode requires an explicit runtime network allowance"
+            )
+        if not isinstance(deps.patch_agent, FilePatchAgent):
+            deps.patch_agent = FilePatchAgent()
+        if not isinstance(deps.test_runner, SubprocessTestRunner):
+            deps.test_runner = SubprocessTestRunner()
+    else:
+        if isinstance(deps.patch_agent, FilePatchAgent):
+            deps.patch_agent = FakePatchAgent()
+        if isinstance(deps.test_runner, SubprocessTestRunner):
+            deps.test_runner = FakeTestRunner()
     if config.jira.mode == "fake":
         if not isinstance(deps.jira, FakeJiraClient):
             deps.jira = build_jira_client("fake")
         return
-    deps.jira = build_jira_client("real")
+    if not allow_network:
+        raise RuntimeError("Real Jira mode requires an explicit runtime network allowance")
+    if not isinstance(deps.jira, RealJiraClient):
+        deps.jira = build_jira_client("real")
 
 
 def _config_source(

@@ -7,7 +7,7 @@ import re
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 RunStatus = Literal[
@@ -37,6 +37,10 @@ class UploadedRepairRequest(BaseModel):
     model_name: str | None = None
     jira_project: str | None = None
     require_approval: bool | None = None
+    github_mode: Literal["fake", "real"] | None = None
+    execution_mode: Literal["fake", "real"] | None = None
+    allow_network: bool = False
+    dry_run: bool | None = None
 
     @field_validator("repo_url")
     @classmethod
@@ -70,6 +74,40 @@ class UploadedRepairRequest(BaseModel):
         if normalized == ".." or normalized.startswith("../") or "/../" in normalized:
             raise ValueError("module_path must stay inside the cloned repository")
         return normalized
+
+
+class DemoRepairRequest(BaseModel):
+    """JSON request for a complete network-free backend demonstration run."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    log_text: str = Field(min_length=1, max_length=5 * 1024 * 1024)
+    github_repo_url: str
+    service_name: str | None = None
+    target_branch: str = "main"
+    test_command: str | None = None
+    jira_project: str | None = None
+    require_approval: bool = False
+
+    @field_validator("log_text")
+    @classmethod
+    def non_blank_log(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("log_text must contain a non-blank log")
+        return value
+
+    @field_validator("github_repo_url")
+    @classmethod
+    def safe_repo_url(cls, value: str) -> str:
+        return UploadedRepairRequest.validate_repo_url(value)
+
+    @field_validator("target_branch")
+    @classmethod
+    def safe_target_branch(cls, value: str) -> str:
+        branch = value.strip()
+        if not branch or not re.fullmatch(r"[A-Za-z0-9._/-]+", branch) or ".." in branch:
+            raise ValueError("target_branch is not a safe branch name")
+        return branch
 
 
 class RepositoryRecord(BaseModel):
@@ -187,6 +225,9 @@ class RepairRunRecord(BaseModel):
     jira_issue_type: str = "Bug"
     jira_mode: Literal["fake", "real"] = "fake"
     github_mode: Literal["fake", "real"] = "fake"
+    execution_mode: Literal["fake", "real"] = "fake"
+    allow_network: bool = False
+    dry_run: bool = True
     plan_id: str | None = None
     selected_hypothesis: str | None = None
     proposed_solution: str | None = None
@@ -194,7 +235,11 @@ class RepairRunRecord(BaseModel):
     commit_sha: str | None = None
     jira_ticket_url: str | None = None
     pull_request_url: str | None = None
+    local_trace_id: str | None = None
     langsmith_trace_url: str | None = None
+    langsmith_enabled: bool = False
+    langsmith_project: str | None = None
+    langsmith_tags: list[str] = Field(default_factory=list)
     last_error: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -206,6 +251,7 @@ class RepairAttemptRecord(BaseModel):
     attempt_number: int
     hypothesis: str
     patch_summary: str
+    changed_files: list[str] = Field(default_factory=list)
     test_command: str
     test_exit_code: int
     test_output: str
@@ -220,15 +266,43 @@ class PullRequestMetadata(BaseModel):
     repo_url: str
     branch_name: str
     base_branch: str
+    title: str
     commit_sha: str
     pull_request_url: str
     status: str = "recorded"
     created_at: datetime = Field(default_factory=utc_now)
 
 
+class ConceptualAgentOutput(BaseModel):
+    agent_name: Literal[
+        "Log Analysis Agent",
+        "Repair Planning Agent",
+        "Code Repair Agent",
+    ]
+    status: Literal["pending", "completed", "failed"]
+    summary: str
+    evidence: list[str] = Field(default_factory=list)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class TraceMetadata(BaseModel):
+    local_trace_id: str
+    local_trace_url: str
+    provider: Literal["local"] = "local"
+    langsmith_configured: bool = False
+    langsmith_active: bool = False
+    langsmith_project: str | None = None
+    langsmith_tags: list[str] = Field(default_factory=list)
+
+
 class RunDetail(BaseModel):
     run: RepairRunRecord
     incident: IncidentRecord
+    agents: dict[str, ConceptualAgentOutput] = Field(default_factory=dict)
+    jira: JiraTicketMetadata | None = None
+    pull_request: PullRequestMetadata | None = None
+    effective_config: dict[str, Any] = Field(default_factory=dict)
+    trace: TraceMetadata
     plan: PlatformRepairPlan | None = None
     attempts: list[RepairAttemptRecord] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+import os
+import re
 from typing import Any, Protocol
 
 from .platform_models import (
@@ -17,6 +19,7 @@ from .platform_models import (
     RepositoryRecord,
     utc_now,
 )
+from .redaction import redact_sensitive_text
 
 
 COLLECTION_NAMES = (
@@ -28,6 +31,33 @@ COLLECTION_NAMES = (
     "repair_runs",
     "repair_attempts",
     "pull_requests",
+)
+
+MONGODB_INDEX_SPECS: tuple[
+    tuple[str, tuple[tuple[str, int], ...], bool, str], ...
+] = (
+    ("repositories", (("repository_id", 1),), True, "uq_repositories_repository_id"),
+    ("log_uploads", (("uploaded_log_id", 1),), True, "uq_log_uploads_uploaded_log_id"),
+    ("incidents", (("incident_id", 1),), True, "uq_incidents_incident_id"),
+    ("jira_tickets", (("jira_ticket_id", 1),), True, "uq_jira_tickets_jira_ticket_id"),
+    ("jira_tickets", (("jira_key", 1),), True, "uq_jira_tickets_jira_key"),
+    ("repair_plans", (("plan_id", 1),), True, "uq_repair_plans_plan_id"),
+    ("repair_runs", (("run_id", 1),), True, "uq_repair_runs_run_id"),
+    ("repair_attempts", (("repair_attempt_id", 1),), True, "uq_repair_attempts_repair_attempt_id"),
+    ("pull_requests", (("pull_request_id", 1),), True, "uq_pull_requests_pull_request_id"),
+    ("incidents", (("status", 1),), False, "ix_incidents_status"),
+    ("repair_runs", (("status", 1),), False, "ix_repair_runs_status"),
+    ("repair_runs", (("created_at", -1),), False, "ix_repair_runs_created_at"),
+    ("repair_runs", (("incident_id", 1),), False, "ix_repair_runs_incident_id"),
+    ("repair_plans", (("run_id", 1),), False, "ix_repair_plans_run_id"),
+    ("repair_attempts", (("run_id", 1),), False, "ix_repair_attempts_run_id"),
+    ("pull_requests", (("incident_id", 1),), False, "ix_pull_requests_incident_id"),
+    ("jira_tickets", (("incident_id", 1),), False, "ix_jira_tickets_incident_id"),
+)
+
+_SAFE_DATABASE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_SENSITIVE_FIELD = re.compile(
+    r"(?i)(api[_-]?key|token|password|passwd|secret|credential|private[_-]?key)"
 )
 
 
@@ -63,6 +93,10 @@ class RepairPlatformRepository(Protocol):
 
     async def get_jira_ticket(self, jira_key: str) -> JiraTicketMetadata | None: ...
 
+    async def get_jira_ticket_for_incident(
+        self, incident_id: str
+    ) -> JiraTicketMetadata | None: ...
+
     async def update_jira_ticket_with_pull_request(
         self, jira_key: str, pull_request_url: str
     ) -> JiraTicketMetadata: ...
@@ -76,6 +110,10 @@ class RepairPlatformRepository(Protocol):
     async def list_attempts(self, run_id: str) -> list[RepairAttemptRecord]: ...
 
     async def save_pull_request(self, pull_request: PullRequestMetadata) -> None: ...
+
+    async def get_pull_request_for_incident(
+        self, incident_id: str
+    ) -> PullRequestMetadata | None: ...
 
 
 class InMemoryRepairPlatformRepository:
@@ -175,6 +213,18 @@ class InMemoryRepairPlatformRepository:
             None,
         )
 
+    async def get_jira_ticket_for_incident(
+        self, incident_id: str
+    ) -> JiraTicketMetadata | None:
+        return next(
+            (
+                _copy(ticket)
+                for ticket in self.jira_tickets.values()
+                if ticket.incident_id == incident_id
+            ),
+            None,
+        )
+
     async def update_jira_ticket_with_pull_request(
         self, jira_key: str, pull_request_url: str
     ) -> JiraTicketMetadata:
@@ -219,9 +269,21 @@ class InMemoryRepairPlatformRepository:
         async with self._lock:
             self.pull_requests[pull_request.pull_request_id] = pull_request.model_copy(deep=True)
 
+    async def get_pull_request_for_incident(
+        self, incident_id: str
+    ) -> PullRequestMetadata | None:
+        return next(
+            (
+                _copy(pull_request)
+                for pull_request in self.pull_requests.values()
+                if pull_request.incident_id == incident_id
+            ),
+            None,
+        )
+
 
 class MongoRepairPlatformRepository:
-    """Motor-backed implementation; importing the project does not require Motor."""
+    """Motor-backed repository with health, indexes, and redacted writes."""
 
     collection_names = COLLECTION_NAMES
 
@@ -229,16 +291,59 @@ class MongoRepairPlatformRepository:
         self.database = database
         self.client = client
 
+    @property
+    def database_name(self) -> str:
+        return str(getattr(self.database, "name", "unknown"))
+
+    @classmethod
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+    ) -> "MongoRepairPlatformRepository":
+        values = environ if environ is not None else os.environ
+        required = ("MONGODB_URI", "MONGODB_DB")
+        missing = [name for name in required if not values.get(name)]
+        if missing:
+            raise RuntimeError(
+                "MongoDB mode requires environment settings: " + ", ".join(missing)
+            )
+        return cls.from_uri(values["MONGODB_URI"], values["MONGODB_DB"])
+
     @classmethod
     def from_uri(cls, uri: str, database_name: str) -> "MongoRepairPlatformRepository":
+        if not uri.strip():
+            raise ValueError("MongoDB URI must not be empty")
+        if not _SAFE_DATABASE_NAME.fullmatch(database_name):
+            raise ValueError("MongoDB database name contains unsupported characters")
         try:
             from motor.motor_asyncio import AsyncIOMotorClient
         except ImportError as exc:
             raise RuntimeError(
                 "MongoDB mode requires Motor. Install the project dependencies first."
             ) from exc
-        client = AsyncIOMotorClient(uri, serverSelectionTimeoutMS=3000)
+        client = AsyncIOMotorClient(
+            uri,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            appname="microservice-ai-repair-bot",
+        )
         return cls(client[database_name], client=client)
+
+    async def ping(self) -> bool:
+        result = await self.database.command("ping")
+        return bool(result.get("ok", 0))
+
+    async def ensure_indexes(self) -> list[str]:
+        created: list[str] = []
+        for collection, keys, unique, name in MONGODB_INDEX_SPECS:
+            index_name = await self.database[collection].create_index(
+                list(keys),
+                unique=unique,
+                name=name,
+                background=True,
+            )
+            created.append(str(index_name))
+        return created
 
     async def create_run_bundle(
         self,
@@ -315,6 +420,13 @@ class MongoRepairPlatformRepository:
     async def get_jira_ticket(self, jira_key: str) -> JiraTicketMetadata | None:
         return await self._get("jira_tickets", "jira_key", jira_key, JiraTicketMetadata)
 
+    async def get_jira_ticket_for_incident(
+        self, incident_id: str
+    ) -> JiraTicketMetadata | None:
+        return await self._get(
+            "jira_tickets", "incident_id", incident_id, JiraTicketMetadata
+        )
+
     async def update_jira_ticket_with_pull_request(
         self, jira_key: str, pull_request_url: str
     ) -> JiraTicketMetadata:
@@ -353,12 +465,21 @@ class MongoRepairPlatformRepository:
     async def save_pull_request(self, pull_request: PullRequestMetadata) -> None:
         await self._upsert("pull_requests", "pull_request_id", pull_request)
 
+    async def get_pull_request_for_incident(
+        self, incident_id: str
+    ) -> PullRequestMetadata | None:
+        return await self._get(
+            "pull_requests", "incident_id", incident_id, PullRequestMetadata
+        )
+
     def close(self) -> None:
-        if self.client is not None:
-            self.client.close()
+        client = self.client
+        self.client = None
+        if client is not None:
+            client.close()
 
     async def _upsert(self, collection: str, key: str, model: Any) -> None:
-        document = model.model_dump(mode="json")
+        document = _redact_for_storage(model.model_dump(mode="python"))
         await self.database[collection].replace_one(
             {key: document[key]}, document, upsert=True
         )
@@ -376,7 +497,24 @@ def _mongo_values(values: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in values.items():
         if hasattr(value, "model_dump"):
-            result[key] = value.model_dump(mode="json")
+            result[key] = _redact_for_storage(value.model_dump(mode="python"))
         else:
-            result[key] = value
+            result[key] = _redact_for_storage(value, field_name=key)
     return result
+
+
+def _redact_for_storage(value: Any, *, field_name: str | None = None) -> Any:
+    if field_name and _SENSITIVE_FIELD.search(field_name):
+        return "<redacted>"
+    if isinstance(value, Mapping):
+        return {
+            str(key): _redact_for_storage(item, field_name=str(key))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_for_storage(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_for_storage(item) for item in value]
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    return value

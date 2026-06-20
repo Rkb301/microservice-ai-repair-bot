@@ -22,6 +22,7 @@ github:
 repair:
   require_plan_approval: true
   dry_run_default: true
+  execution_mode: fake
   test_command: mvn test
   build_system: maven
   language: java
@@ -31,4 +32,3 @@ langsmith:
   project: microservice-ai-repair-bot
   tags:
     - mvp-review
-

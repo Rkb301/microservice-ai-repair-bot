@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import os
 from pathlib import Path
 from typing import Annotated
@@ -9,15 +10,23 @@ from typing import Annotated
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, ValidationError
 
-from ..architecture import project_mvp_metadata
 from ..ingestion import UploadedLogIngestionService
+from ..integrations.github import FakeGitHubClient
+from ..integrations.jira import FakeJiraClient
 from ..persistence import (
     InMemoryRepairPlatformRepository,
     MongoRepairPlatformRepository,
     RepairPlatformRepository,
 )
-from ..platform_models import IncidentRecord, RepairRunRecord, RunDetail, UploadedRepairRequest
+from ..platform_models import (
+    DemoRepairRequest,
+    IncidentRecord,
+    RepairRunRecord,
+    RunDetail,
+    UploadedRepairRequest,
+)
 from ..redaction import redact_sensitive_text
+from ..run_detail import build_run_detail
 from ..tracing import LangSmithTracingConfig
 from ..workflow import (
     WorkflowDependencies,
@@ -33,13 +42,36 @@ class RunCreatedResponse(BaseModel):
     current_step: str
 
 
+class StorageHealthResponse(BaseModel):
+    mode: str
+    healthy: bool
+    database: str | None = None
+
+
+class IntegrationModesResponse(BaseModel):
+    jira_mode: str
+    github_mode: str
+
+
+class HealthResponse(BaseModel):
+    status: str
+    storage: StorageHealthResponse
+    integrations: IntegrationModesResponse
+
+
 def create_app(
     *,
     repository: RepairPlatformRepository | None = None,
     dependencies: WorkflowDependencies | None = None,
     workspace_root: Path | None = None,
 ) -> FastAPI:
-    repo = repository or (dependencies.repository if dependencies else _repository_from_env())
+    owns_repository = repository is None and dependencies is None
+    if repository is not None:
+        repo = repository
+    elif dependencies is not None:
+        repo = dependencies.repository
+    else:
+        repo = _repository_from_env()
     root = (workspace_root or Path(".workspace")).resolve()
     if dependencies is None:
         deps = default_workflow_dependencies(repository=repo, workspace_root=root)
@@ -51,13 +83,63 @@ def create_app(
     ingestion = UploadedLogIngestionService(repo, root)
     graph = build_repair_graph(deps)
 
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            if isinstance(repo, MongoRepairPlatformRepository):
+                try:
+                    if not await repo.ping():
+                        raise RuntimeError("unhealthy ping response")
+                    await repo.ensure_indexes()
+                except Exception:
+                    raise RuntimeError(
+                        "MongoDB startup health/index initialization failed"
+                    ) from None
+            yield
+        finally:
+            close_jira = getattr(deps.jira, "aclose", None)
+            if callable(close_jira):
+                await close_jira()
+            close_github = getattr(deps.github, "aclose", None)
+            if callable(close_github):
+                await close_github()
+            if owns_repository:
+                close_repository = getattr(repo, "close", None)
+                if callable(close_repository):
+                    close_repository()
+
     api = FastAPI(
         title="RepairBot Uploaded-Log Orchestrator",
-        version="0.2.0",
+        version="0.3.0",
         description="Operator API for redacted log uploads and external GitHub repository repair runs.",
+        lifespan=lifespan,
     )
     api.state.repository = repo
     api.state.dependencies = deps
+
+    @api.get("/api/health", response_model=HealthResponse)
+    async def health() -> HealthResponse:
+        if isinstance(repo, MongoRepairPlatformRepository):
+            try:
+                healthy = await repo.ping()
+            except Exception:
+                healthy = False
+            storage = StorageHealthResponse(
+                mode="mongodb",
+                healthy=healthy,
+                database=redact_sensitive_text(repo.database_name),
+            )
+        else:
+            storage = StorageHealthResponse(mode="memory", healthy=True)
+        integrations = IntegrationModesResponse(
+            jira_mode="fake" if isinstance(deps.jira, FakeJiraClient) else "real",
+            github_mode="fake" if isinstance(deps.github, FakeGitHubClient) else "real",
+        )
+        return HealthResponse(
+            status="ok" if storage.healthy else "degraded",
+            storage=storage,
+            integrations=integrations,
+        )
 
     @api.post(
         "/api/repair-runs",
@@ -76,6 +158,10 @@ def create_app(
         model_name: Annotated[str | None, Form()] = None,
         jira_project: Annotated[str | None, Form()] = None,
         require_approval: Annotated[bool | None, Form()] = None,
+        github_mode: Annotated[str | None, Form()] = None,
+        execution_mode: Annotated[str | None, Form()] = None,
+        allow_network: Annotated[bool, Form()] = False,
+        dry_run: Annotated[bool | None, Form()] = None,
     ) -> RunCreatedResponse:
         try:
             request = UploadedRepairRequest(
@@ -89,6 +175,10 @@ def create_app(
                 model_name=model_name,
                 jira_project=jira_project,
                 require_approval=require_approval,
+                github_mode=github_mode,
+                execution_mode=execution_mode,
+                allow_network=allow_network,
+                dry_run=dry_run,
             )
             content = await log_file.read()
             run = await ingestion.create_run(
@@ -112,20 +202,37 @@ def create_app(
     @api.get("/api/repair-runs/{run_id}", response_model=RunDetail)
     async def get_repair_run(run_id: str) -> RunDetail:
         run = await _require_run(repo, run_id)
-        incident = await repo.get_incident(run.incident_id)
-        if incident is None:
-            raise HTTPException(status_code=404, detail="Incident not found")
-        return RunDetail(
-            run=run,
-            incident=incident,
-            plan=await repo.get_plan_for_run(run_id),
-            attempts=await repo.list_attempts(run_id),
-            metadata={
-                **project_mvp_metadata(),
-                "config_source": run.config_source,
-                "effective_config": run.effective_config,
-            },
-        )
+        try:
+            return await build_run_detail(repo, run)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Incident not found") from exc
+
+    @api.post(
+        "/api/demo/runs",
+        response_model=RunDetail,
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def create_demo_run(request: DemoRepairRequest) -> RunDetail:
+        """Run the complete deterministic backend flow from JSON log text."""
+
+        try:
+            repair_request = UploadedRepairRequest(
+                repo_url=request.github_repo_url,
+                repo_branch=request.target_branch,
+                service_name=request.service_name,
+                test_cmd=request.test_command,
+                jira_project=request.jira_project,
+                require_approval=request.require_approval,
+            )
+            run = await ingestion.create_run(
+                request=repair_request,
+                filename=f"{request.service_name or 'service'}-demo.log",
+                content=request.log_text.encode("utf-8"),
+            )
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(status_code=422, detail=_safe_validation_message(exc)) from exc
+        completed = await _run_graph(repo, graph, run)
+        return await build_run_detail(repo, completed)
 
     @api.post("/api/repair-runs/{run_id}/approve-plan", response_model=RunCreatedResponse)
     async def approve_plan(run_id: str) -> RunCreatedResponse:
@@ -210,9 +317,9 @@ async def _require_run(
 def _repository_from_env() -> RepairPlatformRepository:
     uri = os.getenv("MONGODB_URI")
     database_name = os.getenv("MONGODB_DB")
-    if uri and database_name:
-        return MongoRepairPlatformRepository.from_uri(uri, database_name)
-    return InMemoryRepairPlatformRepository()
+    if not uri and not database_name:
+        return InMemoryRepairPlatformRepository()
+    return MongoRepairPlatformRepository.from_env()
 
 
 def _safe_validation_message(exc: Exception) -> str:

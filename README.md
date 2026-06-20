@@ -11,6 +11,8 @@ fixtures only.
 The API scaffold exposes:
 
 - `POST /api/repair-runs` for multipart log uploads and repository metadata
+- `POST /api/demo/runs` for a complete JSON, network-free demonstration run
+- `GET /api/health` for storage health and active integration modes
 - `GET /api/repair-runs` and `GET /api/repair-runs/{run_id}` for status
 - `POST /api/repair-runs/{run_id}/approve-plan` and `/cancel`
 - `GET /api/incidents` and `GET /api/incidents/{incident_id}`
@@ -18,8 +20,257 @@ The API scaffold exposes:
 Start it locally with `python -m uvicorn repairbot.api.app:app --reload`. The
 default runtime uses in-memory persistence plus fake GitHub, Jira, patch, and
 test clients. Set both `MONGODB_URI` and `MONGODB_DB` to select the Motor-backed
-repository. Real GitHub/Jira/LLM adapters require explicit production wiring;
-tests never call external services.
+repository. Real GitHub, Jira, and OpenAI paths require environment credentials
+plus explicit configuration/runtime authorization; default tests never call
+external services.
+
+## Backend-only MVP demo
+
+Install the backend dependencies and start FastAPI:
+
+```powershell
+python -m pip install -e ".[dev]"
+python -m uvicorn repairbot.api.app:app --reload
+```
+
+In another terminal, run a complete local CLI demonstration. The command reads
+the checked-in sample log, executes all workflow stages with deterministic
+adapters, and prints the run ID, incident, proposed solution, ticket/PR links,
+effective model settings, and local trace placeholder:
+
+```powershell
+python -m repairbot.cli demo-run `
+  --sample user-service `
+  --repo-url https://github.com/Rkb301/user-service
+```
+
+The available samples and repository metadata URLs are:
+
+- `user-service` — `https://github.com/Rkb301/user-service`
+- `order-service` — `https://github.com/Rkb301/order-service`
+- `payment-service` — `https://github.com/Rkb301/payment-service`
+
+Run the same complete flow through the JSON API with PowerShell:
+
+```powershell
+$logText = Get-Content -Raw examples\demo-logs\user-service-missing-profile.log
+$body = @{
+  log_text = $logText
+  github_repo_url = "https://github.com/Rkb301/user-service"
+  service_name = "user-service"
+  target_branch = "main"
+} | ConvertTo-Json
+
+$run = Invoke-RestMethod `
+  -Method Post `
+  -Uri http://127.0.0.1:8000/api/demo/runs `
+  -ContentType "application/json" `
+  -Body $body
+$run | ConvertTo-Json -Depth 10
+```
+
+Or use curl after replacing the escaped log text as needed:
+
+```powershell
+curl.exe -X POST http://127.0.0.1:8000/api/demo/runs `
+  -H "Content-Type: application/json" `
+  -d '{"log_text":"ERROR user-service demo\njava.lang.NullPointerException: profile missing","github_repo_url":"https://github.com/Rkb301/user-service","service_name":"user-service","target_branch":"main"}'
+```
+
+Local mode records real-shaped data but performs no external Jira, GitHub,
+OpenAI, MongoDB, or LangSmith calls. Real adapters remain credential-gated and
+disabled by default. `GET /api/repair-runs/{run_id}` returns the same run,
+incident, agent, ticket, PR, effective-config, trace, and metadata fields a
+future operator interface can display. No frontend is included or claimed as
+complete in this pass.
+
+## Production storage and Jira setup
+
+| Capability | Default | Production status |
+| --- | --- | --- |
+| In-memory storage | Enabled for local runs | Process-local and network-free |
+| MongoDB storage | Disabled until both environment settings exist | Real Motor persistence with ping, indexes, redacted writes, and shutdown handling |
+| Fake Jira | Enabled by `jira.mode: fake` | Deterministic local ticket metadata |
+| Real Jira | Disabled until `jira.mode: real` and credentials are configured | Jira Cloud v3 issue creation, health check, and PR-link comments |
+| Fake GitHub PR | Enabled locally | Deterministic PR metadata |
+| Real GitHub PR | Disabled until explicitly selected and authorized | Real clone, repair branch, controlled commit, push, and REST PR creation |
+| Patch/test execution | Fake for local demos | Reviewed three-service patch adapter and shell-free allowlisted test runner in real mode |
+| LangSmith | Disabled by default | Configuration and local trace metadata are available; live verification remains optional |
+
+Credentials belong only in environment variables or an ignored local `.env`.
+Never place MongoDB credentials, Jira email/token values, or other secrets in
+`repairbot.yaml`; the YAML loader rejects secret-looking keys and values.
+
+### MongoDB
+
+Configure a database account with read/write access to one database:
+
+```powershell
+$env:MONGODB_URI = "mongodb+srv://<user>:<password>@<cluster>/"
+$env:MONGODB_DB = "repairbot"
+python -m repairbot.cli storage-check
+```
+
+`storage-check` pings the selected database and initializes 17 named indexes:
+nine unique stable-ID indexes and eight status/run/incident lookup indexes. It
+prints the database name but never the connection URI. When both variables are
+absent, the command reports the in-memory default. A partial configuration
+fails closed.
+
+The API uses MongoDB automatically only when both settings exist. Startup pings
+the database and initializes indexes before serving requests. Check runtime
+health without exposing credentials:
+
+```powershell
+python -m uvicorn repairbot.api.app:app
+Invoke-RestMethod http://127.0.0.1:8000/api/health | ConvertTo-Json -Depth 5
+```
+
+The optional live test is disabled unless the flag and both database settings
+are present. It creates a uniquely named temporary database and removes it at
+the end when practical:
+
+```powershell
+$env:RUN_MONGODB_INTEGRATION_TESTS = "1"
+python -m pytest -q tests/integration/test_mongodb_integration.py
+```
+
+### Jira Cloud
+
+Set the Jira Cloud base URL and credentials only in the environment. The base
+URL must be credential-free HTTPS:
+
+```powershell
+$env:JIRA_BASE_URL = "https://your-domain.atlassian.net"
+$env:JIRA_EMAIL = "engineer@example.com"
+$env:JIRA_API_TOKEN = "<jira-api-token>"
+$env:JIRA_PROJECT_KEY = "DEMO"
+python -m repairbot.cli jira-check
+```
+
+The default `jira-check` validates configuration without making a request. Use
+the explicit network flag to call Jira Cloud `/rest/api/3/myself`:
+
+```powershell
+python -m repairbot.cli jira-check --allow-network
+```
+
+Set `jira.mode: real` in reviewed, secret-free YAML to select the real adapter.
+Issue descriptions use Jira Cloud v3 document format and include the error,
+proposed solution, affected service, repository URL, incident ID, and run ID.
+When `jira.update_pr_link` is enabled, the workflow posts `Pull request: <url>`
+as a Jira comment and avoids duplicate comments within the running process.
+
+The optional Jira integration test can create a real issue and comment, so it
+requires both the explicit flag and a dedicated test project:
+
+```powershell
+$env:JIRA_TEST_PROJECT_KEY = "DEMO"
+$env:RUN_JIRA_INTEGRATION_TESTS = "1"
+python -m pytest -q tests/integration/test_jira_integration.py
+```
+
+The test does not delete the issue because project policy may prohibit deletion.
+Keep the flag unset for normal offline test runs.
+
+### Real GitHub repair execution
+
+Real GitHub mode requires a token in the environment and two explicit runtime
+choices: real mode and a network allowance. Tokens are passed to Git and the
+GitHub REST client without appearing in command arguments or output.
+
+```powershell
+$env:GITHUB_TOKEN = "<GitHub token from your secret manager>"
+```
+
+GitHub REST calls use Bearer authentication. Git clone, `ls-remote`, and push
+use an in-memory HTTP Basic header with `x-access-token` as the username; the
+credential helper is disabled for those subprocesses and the clean repository
+URL remains in `origin`. Check configuration without network access, then opt
+in to a read-only live REST and Git transport check:
+
+```powershell
+python -m repairbot.cli github-check
+python -m repairbot.cli github-check --allow-network --repo-url https://github.com/Rkb301/user-service.git
+```
+
+Use dry-run first. It clones the repository, verifies a clean workspace, creates
+an `ai-fix/...` branch, applies a reviewed deterministic patch, and runs the
+allowlisted test command. It does not commit, push, or create a PR:
+
+```powershell
+python -m repairbot.cli repair-run `
+  --log-file examples/demo-logs/user-service-missing-profile.log `
+  --repo-url https://github.com/Rkb301/user-service.git `
+  --service-name user-service `
+  --target-branch main `
+  --real-git `
+  --allow-network `
+  --dry-run
+```
+
+Remove `--dry-run` only when a real branch push and PR are intended:
+
+```powershell
+python -m repairbot.cli repair-run `
+  --log-file examples/demo-logs/user-service-missing-profile.log `
+  --repo-url https://github.com/Rkb301/user-service.git `
+  --service-name user-service `
+  --target-branch main `
+  --real-git `
+  --allow-network
+```
+
+The same runtime controls are available to multipart API requests as
+`github_mode=real`, `execution_mode=real`, `allow_network=true`, and
+`dry_run=true|false`. Repo-local YAML may select real modes, but it must never
+contain credentials. A runtime allowance is still required.
+
+Production safety rules:
+
+- Only credential-free `https://github.com/<owner>/<repo>` URLs are accepted.
+- Only generated `ai-fix/...` or `bugfix/...` branches may be pushed.
+- Protected branches are never push targets.
+- Real patching begins only from a clean clone.
+- The controlled patch adapter currently supports the three MVP Java services.
+- Only reviewed Maven, Gradle, or pytest commands run, always with `shell=False`.
+- Tests must pass before commit, push, or PR creation.
+- Failed tests retain run evidence but do not create a PR.
+- Patch paths must stay inside the clone and cannot target secrets or deployment files.
+
+The optional live GitHub test is disabled unless every setting and the explicit
+flag are present. It creates a unique repair branch and PR in the configured
+test repository:
+
+```powershell
+$env:GITHUB_TEST_REPO_URL = "https://github.com/<owner>/<dedicated-test-repo>"
+$env:GITHUB_TEST_BASE_BRANCH = "main"
+$env:RUN_GITHUB_INTEGRATION_TESTS = "1"
+python -m pytest -q tests/integration/test_github_integration.py
+```
+
+The live test does not close or delete the PR automatically. Keep the flag unset
+for normal validation.
+
+### OpenAI planner verification
+
+The real structured planner check requires `langchain-openai`, an environment
+key, and an explicit API allowance. The default command is explanatory and
+performs no request:
+
+```powershell
+python -m repairbot.cli ai-planner-check
+```
+
+Run one small structured-output request only when API use is intended:
+
+```powershell
+$env:OPENAI_API_KEY = "<OpenAI key from your secret manager>"
+python -m repairbot.cli ai-planner-check --allow-api
+```
+
+The command reports only provider/model success. It does not print the API key
+or model response content.
 
 The uploaded-log workflow is orchestrated by LangGraph. LangChain provides the
 structured planning and tool-adapter layer, while LangSmith configuration adds
@@ -34,9 +285,9 @@ product-facing example registry is `services.mvp-review.example.yaml`.
 
 The product has exactly three conceptual agents:
 
-1. **Log Analysis Agent** â€” turns the uploaded log into a structured incident.
-2. **Repair Planning Agent** â€” produces the hypothesis, proposed solution, edits, and tests.
-3. **Code Repair Agent** â€” patches the selected external repo and verifies the change.
+1. **Log Analysis Agent** — turns the uploaded log into a structured incident.
+2. **Repair Planning Agent** — produces the hypothesis, proposed solution, edits, and tests.
+3. **Code Repair Agent** — patches the selected external repo and verifies the change.
 
 LangGraph has additional internal workflow nodes, but those nodes are not extra
 agents. The one-model MVP uses **GPT-5 mini** (`openai:gpt-5-mini`) and does not
@@ -48,7 +299,7 @@ created, its URL is written back into Jira. MongoDB/in-memory records retain the
 error, solution, Jira URL, PR URL, target GitHub repo/branch, plan, status, and
 LangSmith trace metadata.
 
-The future UI is a human operator consoleâ€”not a pipeline diagram. The existing
+The future UI is a human operator console—not a pipeline diagram. The existing
 API exposes the fields needed to upload a log, select a GitHub repo, review and
 approve a plan, monitor status, and open Jira, PR, or LangSmith links.
 
@@ -67,23 +318,24 @@ The merge precedence is: explicit operator/API/CLI values, repo-local config,
 orchestrator default YAML, non-secret environment defaults, then hardcoded
 fallbacks. Environment variables always remain the only source for credentials.
 Never put API keys, tokens, passwords, private keys, or credential-bearing URLs
-in repository YAMLâ€”the loader rejects secret-looking data.
+in repository YAML—the loader rejects secret-looking data.
 
 Safe YAML controls the selected allowlisted model, hypothesis/attempt limits,
 Jira project and issue type, Jira title/description/solution templates, GitHub
-base branch and PR behavior, test command, build/language/module settings,
-approval policy, and LangSmith project/tags. Test commands are validated against
-a reviewed Maven/Gradle/pytest allowlist and are never executed by unit tests.
+base branch and PR behavior, execution mode, test command,
+build/language/module settings, approval policy, and LangSmith project/tags.
+Test commands are validated against a reviewed Maven/Gradle/pytest allowlist and
+run without a shell; unit coverage uses only isolated local pytest fixtures.
 
 The MVP default remains one active model, `openai:gpt-5-mini`. Configuration can
 select another model only when that model is explicitly listed in
 `model.allowed_models`; this does not implement multi-model voting.
 
 `jira.mode` and `github.mode` are explicit `fake` or `real` settings. Fake mode
-is the local/test default. Real adapters are production scaffolds, require
+is the local/test default. Real adapters require
 `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, or `GITHUB_TOKEN` from the
-environment, and fail closed when credentials are absent. Reviewed real network
-contracts are intentionally not implemented in this scaffold.
+environment, fail closed when credentials are absent, and remain blocked until
+the matching runtime allowance is supplied.
 
 Jira PR backlink updates are controlled by `jira.update_pr_link` and default to
 `true`. The run-detail API returns `config_source` and the redacted
@@ -125,7 +377,7 @@ The planning and reflection files are structured, user-readable summaries. They 
 - Uses SQLite at `.repairbot/repairbot.db` for local storage.
 - Uses JSON artifacts under `runs/` or a path passed with `--out`.
 - Implements test-time compute at runtime: streaming, parsing, clustering, hypothesis generation/ranking, code inspection budgets, test runs, patch rejection, retries, and PR creation only after passing tests.
-- Includes a three-service MVP registry and four legacy local fixture directories.
+- Includes a three-service MVP registry; local compatibility fixtures are not product repositories.
 - Includes a public-GitHub safety scanner and optional pre-commit hook.
 
 ## Setup

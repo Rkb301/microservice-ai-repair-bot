@@ -275,7 +275,11 @@ def build_langchain_tools(
 
     @tool
     async def open_github_pull_request(
-        branch_name: str, base_branch: str, title: str, body: str
+        branch_name: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        changed_files: list[str],
     ) -> str:
         """Commit and open a PR through the injected GitHub client."""
         result = await github.commit_and_open_pull_request(
@@ -285,6 +289,7 @@ def build_langchain_tools(
             branch_name=branch_name,
             title=title,
             body=redact_sensitive_text(body),
+            changed_files=changed_files,
         )
         return result.pull_request_url
 

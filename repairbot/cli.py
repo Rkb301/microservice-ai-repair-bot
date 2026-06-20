@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 from datetime import UTC, datetime
@@ -531,6 +532,410 @@ def uploaded_log_repair(
     except ValueError as exc:
         raise typer.BadParameter(redact_sensitive_text(str(exc))) from exc
     typer.echo(json.dumps(result, indent=2))
+
+
+@app.command("demo-run")
+def demo_run(
+    sample: Annotated[
+        str,
+        typer.Option(
+            "--sample",
+            help="Built-in service sample: user-service, order-service, or payment-service.",
+        ),
+    ] = "user-service",
+    repo_url: Annotated[
+        str | None,
+        typer.Option("--repo-url", help="GitHub repository URL shown in demo metadata."),
+    ] = None,
+    target_branch: Annotated[str, typer.Option("--target-branch")] = "main",
+    workspace: Annotated[
+        Path,
+        typer.Option("--workspace", help="Ignored local directory for deterministic run artifacts."),
+    ] = Path(".workspace"),
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", exists=True, dir_okay=False, help="Optional safe YAML defaults file."),
+    ] = None,
+) -> None:
+    """Run a complete backend-only sample using local deterministic adapters."""
+
+    import asyncio
+
+    from .demo import execute_demo_sample
+
+    try:
+        detail = asyncio.run(
+            execute_demo_sample(
+                sample=sample,
+                repo_url=repo_url,
+                target_branch=target_branch,
+                workspace_root=workspace,
+                config_path=config,
+            )
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(redact_sensitive_text(str(exc))) from exc
+
+    model = detail.effective_config.get("model", {})
+    jira = detail.jira
+    pull_request = detail.pull_request
+    typer.echo(f"run ID: {detail.run.run_id}")
+    typer.echo(f"status: {detail.run.status}")
+    typer.echo(f"error name: {detail.incident.error_name}")
+    typer.echo(f"proposed solution: {detail.incident.proposed_solution}")
+    typer.echo(f"Jira-style URL: {jira.jira_ticket_url if jira else '(not recorded)'}")
+    typer.echo(
+        f"PR-style URL: {pull_request.pull_request_url if pull_request else '(not recorded)'}"
+    )
+    typer.echo(
+        "effective config: "
+        f"provider={model.get('provider')} model={model.get('model')} "
+        f"jira={detail.run.jira_mode} github={detail.run.github_mode}"
+    )
+    typer.echo(f"trace placeholder: {detail.trace.local_trace_url}")
+
+
+@app.command("repair-run")
+def repair_run(
+    log_file: Annotated[Path, typer.Option("--log-file", exists=True, dir_okay=False)],
+    repo_url: Annotated[str, typer.Option("--repo-url")],
+    service_name: Annotated[str, typer.Option("--service-name")],
+    target_branch: Annotated[str, typer.Option("--target-branch")] = "main",
+    real_git: Annotated[
+        bool,
+        typer.Option("--real-git", help="Select real clone, patch/test, push, and PR adapters."),
+    ] = False,
+    allow_network: Annotated[
+        bool,
+        typer.Option("--allow-network", help="Required for real GitHub and other configured network adapters."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Clone, branch, patch, and test, but do not commit, push, or open a PR."),
+    ] = False,
+    config: Annotated[
+        Path | None,
+        typer.Option("--config", exists=True, dir_okay=False, help="Optional safe YAML defaults file."),
+    ] = None,
+) -> None:
+    """Run the credential-gated backend repair workflow."""
+
+    import asyncio
+
+    from .ingestion import UploadedLogIngestionService
+    from .persistence import InMemoryRepairPlatformRepository, MongoRepairPlatformRepository
+    from .platform_config import load_config_file
+    from .platform_models import UploadedRepairRequest
+    from .run_detail import build_run_detail
+    from .workflow import (
+        build_repair_graph,
+        default_workflow_dependencies,
+        initial_workflow_state,
+    )
+
+    RepairBotSettings.from_env()
+    if real_git and not allow_network:
+        raise typer.BadParameter("--real-git requires --allow-network")
+    if real_git and not os.getenv("GITHUB_TOKEN"):
+        raise typer.BadParameter("--real-git requires GITHUB_TOKEN in the environment")
+
+    async def execute():
+        mongodb_configured = bool(os.getenv("MONGODB_URI") or os.getenv("MONGODB_DB"))
+        if allow_network and mongodb_configured:
+            repository = MongoRepairPlatformRepository.from_env()
+            if not await repository.ping():
+                raise RuntimeError("MongoDB ping returned an unhealthy response")
+            await repository.ensure_indexes()
+            storage_mode = "mongodb"
+        else:
+            repository = InMemoryRepairPlatformRepository()
+            storage_mode = "memory"
+        dependencies = default_workflow_dependencies(
+            repository=repository,
+            workspace_root=Path(".workspace").resolve(),
+        )
+        if config is not None:
+            load_config_file(config)
+            dependencies.default_config_path = config.resolve()
+        try:
+            ingestion = UploadedLogIngestionService(
+                repository,
+                dependencies.workspace_root,
+            )
+            run = await ingestion.create_run(
+                request=UploadedRepairRequest(
+                    repo_url=repo_url,
+                    repo_branch=target_branch,
+                    service_name=service_name,
+                    require_approval=False,
+                    github_mode="real" if real_git else "fake",
+                    execution_mode="real" if real_git else "fake",
+                    allow_network=allow_network,
+                    dry_run=dry_run,
+                ),
+                filename=log_file.name,
+                content=log_file.read_bytes(),
+            )
+            graph = build_repair_graph(dependencies)
+            await graph.ainvoke(await initial_workflow_state(repository, run))
+            stored = await repository.get_run(run.run_id)
+            if stored is None:
+                raise RuntimeError("Repair run was not persisted")
+            return await build_run_detail(repository, stored), storage_mode
+        finally:
+            close_github = getattr(dependencies.github, "aclose", None)
+            if callable(close_github):
+                await close_github()
+            close_jira = getattr(dependencies.jira, "aclose", None)
+            if callable(close_jira):
+                await close_jira()
+            close_repository = getattr(repository, "close", None)
+            if callable(close_repository):
+                close_repository()
+
+    try:
+        detail, storage_mode = asyncio.run(execute())
+    except Exception as exc:
+        typer.echo(f"repair-run failed: {redact_sensitive_text(str(exc))}")
+        raise typer.Exit(code=1)
+    latest_attempt = detail.attempts[-1] if detail.attempts else None
+    changed_files = latest_attempt.changed_files if latest_attempt else []
+    typer.echo(f"run ID: {detail.run.run_id}")
+    typer.echo(f"status: {detail.run.status}")
+    typer.echo(f"branch: {detail.run.branch_name or '(none)'}")
+    typer.echo(
+        f"tests passed: {latest_attempt.tests_passed if latest_attempt else False}"
+    )
+    typer.echo("changed files: " + (", ".join(changed_files) or "(none)"))
+    typer.echo(
+        f"Jira URL: {detail.jira.jira_ticket_url if detail.jira else '(none)'}"
+    )
+    typer.echo(
+        "PR URL: "
+        f"{detail.pull_request.pull_request_url if detail.pull_request else '(none)'}"
+    )
+    typer.echo(f"storage mode: {storage_mode}")
+    typer.echo(f"model: {detail.run.model_name}")
+    typer.echo(f"dry run: {detail.run.dry_run}")
+
+
+@app.command("github-check")
+def github_check(
+    allow_network: Annotated[
+        bool,
+        typer.Option(
+            "--allow-network",
+            help="Explicitly call GitHub REST and run a read-only git ls-remote.",
+        ),
+    ] = False,
+    repo_url: Annotated[
+        str | None,
+        typer.Option(
+            "--repo-url",
+            help="Credential-free GitHub HTTPS repository URL to verify.",
+        ),
+    ] = None,
+) -> None:
+    """Validate GitHub auth configuration and optionally verify live access."""
+
+    import asyncio
+
+    from .integrations.github import (
+        GitHubIntegrationError,
+        RealGitHubClient,
+        build_github_client,
+        parse_github_repo_url,
+    )
+
+    RepairBotSettings.from_env()
+    if not os.getenv("GITHUB_TOKEN"):
+        typer.echo("github mode: unavailable")
+        typer.echo("missing settings: GITHUB_TOKEN")
+        raise typer.Exit(code=1)
+    if repo_url is not None:
+        try:
+            parse_github_repo_url(repo_url)
+        except ValueError as exc:
+            raise typer.BadParameter(redact_sensitive_text(str(exc))) from exc
+    if allow_network and repo_url is None:
+        raise typer.BadParameter("--allow-network requires --repo-url")
+    try:
+        client = build_github_client("real")
+    except (RuntimeError, ValueError):
+        typer.echo("github mode: invalid real configuration")
+        raise typer.Exit(code=1)
+    if not isinstance(client, RealGitHubClient):
+        raise typer.Exit(code=1)
+
+    typer.echo("github mode: real")
+    typer.echo("REST authentication: Bearer")
+    typer.echo("git authentication: HTTP Basic")
+    if not allow_network:
+        asyncio.run(client.aclose())
+        typer.echo("network check: skipped; pass --allow-network with --repo-url")
+        return
+
+    async def execute():
+        try:
+            status = await client.check_repository_access(repo_url or "")
+            git_ok = await client.check_git_remote(repo_url or "")
+            return status, git_ok
+        finally:
+            await client.aclose()
+
+    try:
+        status, git_ok = asyncio.run(execute())
+    except (GitHubIntegrationError, ValueError) as exc:
+        typer.echo(f"GitHub check: failed; {redact_sensitive_text(str(exc))}")
+        raise typer.Exit(code=1)
+    permissions = ", ".join(
+        f"{name}={'true' if allowed else 'false'}"
+        for name, allowed in sorted(status.permissions.items())
+    ) or "not reported"
+    typer.echo(f"repo full name: {redact_sensitive_text(status.full_name)}")
+    typer.echo(f"visibility: {'private' if status.private else 'public'}")
+    typer.echo(f"permissions: {permissions}")
+    typer.echo(f"git ls-remote: {'passed' if git_ok else 'failed'}")
+    if not git_ok:
+        raise typer.Exit(code=1)
+
+
+@app.command("ai-planner-check")
+def ai_planner_check(
+    allow_api: Annotated[
+        bool,
+        typer.Option("--allow-api", help="Required to make one small OpenAI structured-output request."),
+    ] = False,
+) -> None:
+    """Verify the configured real OpenAI structured planner path."""
+
+    if not allow_api:
+        typer.echo(
+            "planner check: skipped; pass --allow-api to verify one small structured OpenAI request"
+        )
+        return
+    if not os.getenv("OPENAI_API_KEY"):
+        typer.echo("planner check: unavailable; OPENAI_API_KEY is not set")
+        raise typer.Exit(code=1)
+    import asyncio
+
+    from .openai_planner_check import OpenAIPlannerCheckError, run_planner_check
+
+    settings = RepairBotSettings.from_env()
+    try:
+        model_name = asyncio.run(run_planner_check(settings.model))
+    except OpenAIPlannerCheckError as exc:
+        typer.echo(f"planner check: failed; {redact_sensitive_text(str(exc))}")
+        raise typer.Exit(code=1)
+    typer.echo(f"planner check: passed; provider=openai model={model_name}")
+
+
+@app.command("storage-check")
+def storage_check() -> None:
+    """Verify the selected storage backend and initialize MongoDB indexes."""
+
+    import asyncio
+
+    from .persistence import MongoRepairPlatformRepository
+
+    RepairBotSettings.from_env()
+    uri = os.getenv("MONGODB_URI")
+    database_name = os.getenv("MONGODB_DB")
+    if not uri and not database_name:
+        typer.echo("storage mode: memory")
+        typer.echo("healthy: true")
+        typer.echo("MongoDB check: skipped because MONGODB_URI and MONGODB_DB are not set")
+        return
+    missing = [
+        name
+        for name, value in (("MONGODB_URI", uri), ("MONGODB_DB", database_name))
+        if not value
+    ]
+    if missing:
+        typer.echo("storage mode: invalid MongoDB configuration")
+        typer.echo("missing settings: " + ", ".join(missing))
+        raise typer.Exit(code=1)
+
+    async def execute() -> tuple[str, int]:
+        repository = MongoRepairPlatformRepository.from_env()
+        try:
+            if not await repository.ping():
+                raise RuntimeError("MongoDB ping returned an unhealthy response")
+            indexes = await repository.ensure_indexes()
+            return repository.database_name, len(indexes)
+        finally:
+            repository.close()
+
+    try:
+        selected_database, index_count = asyncio.run(execute())
+    except Exception:
+        typer.echo("storage mode: mongodb")
+        typer.echo("healthy: false")
+        typer.echo("MongoDB check failed; verify connectivity and credentials")
+        raise typer.Exit(code=1)
+    typer.echo("storage mode: mongodb")
+    typer.echo("healthy: true")
+    typer.echo(f"database: {redact_sensitive_text(selected_database)}")
+    typer.echo(f"indexes initialized: {index_count}")
+
+
+@app.command("jira-check")
+def jira_check(
+    allow_network: Annotated[
+        bool,
+        typer.Option(
+            "--allow-network",
+            help="Explicitly call Jira Cloud /rest/api/3/myself.",
+        ),
+    ] = False,
+) -> None:
+    """Validate real Jira configuration and optionally test connectivity."""
+
+    import asyncio
+
+    from .integrations.jira import RealJiraClient, build_jira_client
+    from .platform_config import DEFAULT_CONFIG_PATH, load_config_file
+
+    RepairBotSettings.from_env()
+    required = ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN")
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        typer.echo("jira mode: unavailable")
+        typer.echo("missing settings: " + ", ".join(missing))
+        raise typer.Exit(code=1)
+    try:
+        client = build_jira_client("real")
+    except (RuntimeError, ValueError):
+        typer.echo("jira mode: invalid real configuration")
+        raise typer.Exit(code=1)
+    if not isinstance(client, RealJiraClient):
+        raise typer.Exit(code=1)
+    project_key = os.getenv("JIRA_PROJECT_KEY")
+    if not project_key and DEFAULT_CONFIG_PATH.is_file():
+        project_key = load_config_file(DEFAULT_CONFIG_PATH).jira.project_key
+    project_key = project_key or "not set"
+    typer.echo("jira mode: real")
+    typer.echo(f"base URL: {client.base_url}")
+    typer.echo(f"project key: {redact_sensitive_text(project_key)}")
+    if not allow_network:
+        asyncio.run(client.aclose())
+        typer.echo("network check: skipped; pass --allow-network to call Jira")
+        return
+
+    async def execute() -> bool:
+        try:
+            return await client.health_check()
+        finally:
+            await client.aclose()
+
+    try:
+        healthy = asyncio.run(execute())
+    except Exception:
+        typer.echo("network check: failed; verify Jira URL, access, and credentials")
+        raise typer.Exit(code=1)
+    typer.echo(f"network check: {'passed' if healthy else 'failed'}")
+    if not healthy:
+        raise typer.Exit(code=1)
 
 
 @app.command("safety-check")
