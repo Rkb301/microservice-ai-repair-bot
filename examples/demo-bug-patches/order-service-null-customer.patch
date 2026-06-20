@@ -1,0 +1,20 @@
+diff --git a/src/main/java/com/example/order/OrderServiceApp.java b/src/main/java/com/example/order/OrderServiceApp.java
+--- a/src/main/java/com/example/order/OrderServiceApp.java
++++ b/src/main/java/com/example/order/OrderServiceApp.java
+@@ -23,5 +23,5 @@ public class OrderServiceApp {
+         String path = exchange.getRequestURI().getPath();
+         if ("POST".equals(exchange.getRequestMethod()) && "/orders".equals(path)) {
+-            write(exchange, 201, createOrder(new Customer("42")));
++            write(exchange, 201, createOrder(null));
+             return;
+         }
+@@ -41,9 +41,6 @@ public class OrderServiceApp {
+     }
+ 
+     public static String createOrder(Customer customer) {
+-        if (customer == null || customer.id() == null || customer.id().isBlank()) {
+-            return "{\"error\":\"customer is required\"}";
+-        }
+         String customerId = customer.id();
+         return "{\"orderId\":\"ord-1\",\"customerId\":\"" + customerId + "\"}";
+     }

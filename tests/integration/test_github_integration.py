@@ -30,7 +30,7 @@ def test_real_github_clone_push_and_pull_request(tmp_path: Path) -> None:
         client = build_github_client("real")
         assert isinstance(client, RealGitHubClient)
         marker = uuid4().hex[:10]
-        branch = f"ai-fix/integration/{marker}"
+        branch = f"bugfix/integration-{marker}"
         clone = tmp_path / "repo"
         try:
             await client.clone_repository(

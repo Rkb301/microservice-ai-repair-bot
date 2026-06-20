@@ -36,6 +36,9 @@ class UploadedRepairRequest(BaseModel):
     test_cmd: str | None = None
     model_name: str | None = None
     jira_project: str | None = None
+    jira_mode: Literal["fake", "real"] | None = None
+    planner_mode: Literal["heuristic", "openai"] | None = None
+    allow_api: bool = False
     require_approval: bool | None = None
     github_mode: Literal["fake", "real"] | None = None
     execution_mode: Literal["fake", "real"] | None = None
@@ -171,6 +174,7 @@ class IncidentRecord(BaseModel):
 class JiraTicketMetadata(BaseModel):
     jira_ticket_id: str
     incident_id: str
+    run_id: str | None = None
     project_key: str
     issue_type: str = "Bug"
     jira_key: str
@@ -222,11 +226,29 @@ class RepairRunRecord(BaseModel):
     operator_overrides: dict[str, Any] = Field(default_factory=dict)
     model_provider: str = "openai"
     model_name: str = "openai:gpt-5-mini"
+    planner_mode: Literal["heuristic", "openai"] = "heuristic"
+    agents_enabled: bool = True
+    agent_count: int = 3
+    agent_names: list[str] = Field(
+        default_factory=lambda: [
+            "LogAnalysisAgent",
+            "RepairPlanningAgent",
+            "ReviewPrAgent",
+        ]
+    )
+    openai_api_invoked: bool = False
+    langchain_used: bool = False
+    langgraph_used: bool = True
+    prompt_version: int = 1
+    prompt_template_names: list[str] = Field(default_factory=list)
+    rendered_agent_inputs: dict[str, str] = Field(default_factory=dict)
+    agent_outputs: dict[str, dict[str, Any]] = Field(default_factory=dict)
     jira_issue_type: str = "Bug"
     jira_mode: Literal["fake", "real"] = "fake"
     github_mode: Literal["fake", "real"] = "fake"
     execution_mode: Literal["fake", "real"] = "fake"
     allow_network: bool = False
+    allow_api: bool = False
     dry_run: bool = True
     plan_id: str | None = None
     selected_hypothesis: str | None = None
@@ -253,8 +275,11 @@ class RepairAttemptRecord(BaseModel):
     patch_summary: str
     changed_files: list[str] = Field(default_factory=list)
     test_command: str
+    resolved_test_executable: str | None = None
     test_exit_code: int
     test_output: str
+    test_stdout_tail: str = ""
+    test_stderr_tail: str = ""
     tests_passed: bool
     reflection: str | None = None
     created_at: datetime = Field(default_factory=utc_now)
@@ -263,6 +288,7 @@ class RepairAttemptRecord(BaseModel):
 class PullRequestMetadata(BaseModel):
     pull_request_id: str
     incident_id: str
+    run_id: str | None = None
     repo_url: str
     branch_name: str
     base_branch: str
@@ -275,9 +301,9 @@ class PullRequestMetadata(BaseModel):
 
 class ConceptualAgentOutput(BaseModel):
     agent_name: Literal[
-        "Log Analysis Agent",
-        "Repair Planning Agent",
-        "Code Repair Agent",
+        "LogAnalysisAgent",
+        "RepairPlanningAgent",
+        "ReviewPrAgent",
     ]
     status: Literal["pending", "completed", "failed"]
     summary: str

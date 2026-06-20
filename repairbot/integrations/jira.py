@@ -5,9 +5,11 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 import re
 from typing import Any, Protocol
 from urllib.parse import quote, urlsplit
+from uuid import uuid4
 
 import httpx
 
@@ -101,7 +103,9 @@ class FakeJiraClient:
                 jira_key=existing.jira_key,
                 jira_ticket_url=existing.jira_ticket_url,
             )
-        number = 1001 + len(self.tickets)
+        identity = run_id or f"{incident_id}:{uuid4().hex}"
+        digest = int(hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12], 16)
+        number = 1_000_000_000 + (digest % 9_000_000_000)
         key = f"{safe_project}-{number}"
         result = JiraTicketResult(
             jira_key=key,

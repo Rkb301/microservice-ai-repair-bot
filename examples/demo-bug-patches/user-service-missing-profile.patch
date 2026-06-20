@@ -1,0 +1,13 @@
+diff --git a/src/main/java/com/example/user/UserServiceApp.java b/src/main/java/com/example/user/UserServiceApp.java
+--- a/src/main/java/com/example/user/UserServiceApp.java
++++ b/src/main/java/com/example/user/UserServiceApp.java
+@@ -47,9 +47,6 @@ public class UserServiceApp {
+     public static String getProfile(String userId) {
+         String profile = PROFILES.get(userId);
+-        if (profile == null) {
+-            return "{\"error\":\"profile not found\"}";
+-        }
+         return "{\"profile\":\"" + profile.toUpperCase() + "\"}";
+     }
+ 
+     private static void write(HttpExchange exchange, int status, String body) throws IOException {

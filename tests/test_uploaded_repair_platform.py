@@ -183,6 +183,7 @@ def test_persistence_schema_has_required_collections_and_incident_fields() -> No
         "target_branch",
     } <= fields.keys()
     assert {
+        "run_id",
         "title",
         "description",
         "solution",
@@ -221,12 +222,16 @@ def test_langgraph_dry_run_completes_with_injected_fakes(tmp_path: Path) -> None
         assert incident.proposed_solution == stored.proposed_solution
         jira = await repository.get_jira_ticket(next(iter(dependencies.jira.tickets)))
         assert jira is not None
+        assert jira.run_id == run.run_id
         assert jira.title == "[example-service] NullPointerException"
         assert jira.description == "order customer was missing"
         assert jira.solution == stored.proposed_solution
         assert jira.pull_request_url == stored.pull_request_url
         fake_ticket = dependencies.jira.tickets[jira.jira_key]
         assert fake_ticket.pull_request_url == stored.pull_request_url
+        pull_request = await repository.get_pull_request_for_run(run.run_id)
+        assert pull_request is not None
+        assert pull_request.run_id == run.run_id
         assert len(await repository.list_attempts(run.run_id)) == 1
 
     asyncio.run(scenario())
@@ -281,16 +286,16 @@ def test_project_mvp_constraints_are_executable_and_documented() -> None:
     assert MAX_TOTAL_REPOSITORIES == 4
     assert MAX_MICROSERVICE_REPOSITORIES == 3
     assert CONCEPTUAL_AGENTS == (
-        "Log Analysis Agent",
-        "Repair Planning Agent",
-        "Code Repair Agent",
+        "LogAnalysisAgent",
+        "RepairPlanningAgent",
+        "ReviewPrAgent",
     )
     assert MVP_MODEL == DEFAULT_MODEL == "openai:gpt-5-mini"
     config = load_services_config("services.mvp-review.example.yaml")
     assert len(config.services) == 3
     readme = Path("README.md").read_text(encoding="utf-8")
     assert "four repositories total" in readme
-    assert "exactly three conceptual agents" in readme
+    assert "exactly three agents" in readme
     assert "five model" in readme
     assert "not implemented" in readme
 

@@ -1,0 +1,19 @@
+diff --git a/src/main/java/com/example/payment/PaymentServiceApp.java b/src/main/java/com/example/payment/PaymentServiceApp.java
+--- a/src/main/java/com/example/payment/PaymentServiceApp.java
++++ b/src/main/java/com/example/payment/PaymentServiceApp.java
+@@ -20,5 +20,5 @@ public class PaymentServiceApp {
+         String path = exchange.getRequestURI().getPath();
+         if ("POST".equals(exchange.getRequestMethod()) && "/payments/charge".equals(path)) {
+-            write(exchange, 200, charge(25));
++            write(exchange, 200, charge(-1));
+             return;
+         }
+@@ -39,7 +39,7 @@ public class PaymentServiceApp {
+     }
+ 
+     public static String charge(int amount) {
+-        if (amount <= 0) {
++        if (amount == 0) {
+             throw new IllegalArgumentException("amount must be positive");
+         }
+         return "{\"paymentId\":\"pay-100\",\"amount\":" + amount + "}";

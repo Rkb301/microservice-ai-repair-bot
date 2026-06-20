@@ -98,7 +98,7 @@ def test_file_patch_agent_applies_reviewed_service_patches(
         result = await FilePatchAgent().apply_patch(
             repo_path=tmp_path,
             module_path=None,
-            branch_name=f"ai-fix/{service_name}/test",
+            branch_name=f"bugfix/{service_name}-test",
             selected_hypothesis="The input needs validation",
             service_name=service_name,
         )
@@ -161,13 +161,13 @@ def test_github_payload_and_validation_are_network_free() -> None:
     payload = build_github_pull_request_payload(
         title="Repair missing profile",
         body="Validated with mvn test",
-        head_branch="ai-fix/user-service/test",
+        head_branch="bugfix/user-service-test",
         base_branch="main",
     )
     assert payload == {
         "title": "Repair missing profile",
         "body": "Validated with mvn test",
-        "head": "ai-fix/user-service/test",
+        "head": "bugfix/user-service-test",
         "base": "main",
     }
     assert parse_github_repo_url("https://github.com/Rkb301/user-service.git") == (
@@ -225,7 +225,7 @@ def test_real_github_local_git_and_mock_pr_flow(tmp_path: Path) -> None:
                 token="unit-test-token",
                 http_client=http_client,
             )
-            branch = "ai-fix/user-service/unit-test"
+            branch = "bugfix/user-service-unit-test"
             await client.create_branch(
                 repo_path=clone,
                 base_branch="main",
@@ -273,8 +273,8 @@ def test_ai_planner_check_is_explicit_and_safe_without_key(monkeypatch) -> None:
 
 def test_openai_planner_check_structured_path_with_mock_model(monkeypatch) -> None:
     class FakeStructuredModel:
-        async def ainvoke(self, prompt: str):
-            assert "missing null guard" in prompt
+        async def ainvoke(self, prompt):
+            assert "missing profile null guard" in str(prompt)
             return {
                 "hypothesis": "The value lacks a null guard",
                 "proposed_change": "Add a narrow validation check",
@@ -295,9 +295,11 @@ def test_openai_planner_check_structured_path_with_mock_model(monkeypatch) -> No
         "langchain_openai",
         SimpleNamespace(ChatOpenAI=FakeChatOpenAI),
     )
-    assert asyncio.run(run_planner_check("openai:gpt-5-mini")) == (
-        "openai:gpt-5-mini"
-    )
+    result = asyncio.run(run_planner_check("openai:gpt-5-mini"))
+    assert result.model_name == "openai:gpt-5-mini"
+    assert result.api_invoked is True
+    assert result.rendered_prompt_count == 3
+    assert result.parsed_response.test_command == "mvn test"
 
 
 def test_repair_run_requires_explicit_network_allowance() -> None:
@@ -356,7 +358,7 @@ def test_real_dry_run_skips_commit_push_pr_and_jira_backlink(tmp_path: Path) -> 
                 "incident_id": "inc_dry",
                 "repo_url": "https://github.com/Rkb301/user-service",
                 "repo_branch": "main",
-                "branch_name": "ai-fix/user-service/dry-run",
+                "branch_name": "bugfix/DEMO-1001-user-service-null-pointer",
                 "error_name": "NullPointerException",
                 "selected_hypothesis": "Guard missing profile",
                 "test_cmd": "mvn test",

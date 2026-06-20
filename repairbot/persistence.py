@@ -53,6 +53,8 @@ MONGODB_INDEX_SPECS: tuple[
     ("repair_attempts", (("run_id", 1),), False, "ix_repair_attempts_run_id"),
     ("pull_requests", (("incident_id", 1),), False, "ix_pull_requests_incident_id"),
     ("jira_tickets", (("incident_id", 1),), False, "ix_jira_tickets_incident_id"),
+    ("pull_requests", (("run_id", 1),), False, "ix_pull_requests_run_id"),
+    ("jira_tickets", (("run_id", 1),), False, "ix_jira_tickets_run_id"),
 )
 
 _SAFE_DATABASE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -97,6 +99,10 @@ class RepairPlatformRepository(Protocol):
         self, incident_id: str
     ) -> JiraTicketMetadata | None: ...
 
+    async def get_jira_ticket_for_run(
+        self, run_id: str
+    ) -> JiraTicketMetadata | None: ...
+
     async def update_jira_ticket_with_pull_request(
         self, jira_key: str, pull_request_url: str
     ) -> JiraTicketMetadata: ...
@@ -113,6 +119,10 @@ class RepairPlatformRepository(Protocol):
 
     async def get_pull_request_for_incident(
         self, incident_id: str
+    ) -> PullRequestMetadata | None: ...
+
+    async def get_pull_request_for_run(
+        self, run_id: str
     ) -> PullRequestMetadata | None: ...
 
 
@@ -225,6 +235,18 @@ class InMemoryRepairPlatformRepository:
             None,
         )
 
+    async def get_jira_ticket_for_run(
+        self, run_id: str
+    ) -> JiraTicketMetadata | None:
+        return next(
+            (
+                _copy(ticket)
+                for ticket in self.jira_tickets.values()
+                if ticket.run_id == run_id
+            ),
+            None,
+        )
+
     async def update_jira_ticket_with_pull_request(
         self, jira_key: str, pull_request_url: str
     ) -> JiraTicketMetadata:
@@ -277,6 +299,18 @@ class InMemoryRepairPlatformRepository:
                 _copy(pull_request)
                 for pull_request in self.pull_requests.values()
                 if pull_request.incident_id == incident_id
+            ),
+            None,
+        )
+
+    async def get_pull_request_for_run(
+        self, run_id: str
+    ) -> PullRequestMetadata | None:
+        return next(
+            (
+                _copy(pull_request)
+                for pull_request in self.pull_requests.values()
+                if pull_request.run_id == run_id
             ),
             None,
         )
@@ -427,6 +461,11 @@ class MongoRepairPlatformRepository:
             "jira_tickets", "incident_id", incident_id, JiraTicketMetadata
         )
 
+    async def get_jira_ticket_for_run(
+        self, run_id: str
+    ) -> JiraTicketMetadata | None:
+        return await self._get("jira_tickets", "run_id", run_id, JiraTicketMetadata)
+
     async def update_jira_ticket_with_pull_request(
         self, jira_key: str, pull_request_url: str
     ) -> JiraTicketMetadata:
@@ -471,6 +510,11 @@ class MongoRepairPlatformRepository:
         return await self._get(
             "pull_requests", "incident_id", incident_id, PullRequestMetadata
         )
+
+    async def get_pull_request_for_run(
+        self, run_id: str
+    ) -> PullRequestMetadata | None:
+        return await self._get("pull_requests", "run_id", run_id, PullRequestMetadata)
 
     def close(self) -> None:
         client = self.client

@@ -8,9 +8,9 @@ from typing import Final
 MAX_TOTAL_REPOSITORIES: Final = 4
 MAX_MICROSERVICE_REPOSITORIES: Final = 3
 CONCEPTUAL_AGENTS: Final = (
-    "Log Analysis Agent",
-    "Repair Planning Agent",
-    "Code Repair Agent",
+    "LogAnalysisAgent",
+    "RepairPlanningAgent",
+    "ReviewPrAgent",
 )
 MVP_MODEL: Final = "openai:gpt-5-mini"
 ENTERPRISE_FUTURE_MODEL_CANDIDATES: Final = 5

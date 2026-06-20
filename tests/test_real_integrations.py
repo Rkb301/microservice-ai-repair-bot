@@ -24,7 +24,15 @@ from repairbot.persistence import (
     InMemoryRepairPlatformRepository,
     MongoRepairPlatformRepository,
 )
-from repairbot.platform_models import RepairAttemptRecord
+from repairbot.platform_models import (
+    IncidentRecord,
+    JiraTicketMetadata,
+    LogUploadRecord,
+    RepairAttemptRecord,
+    RepairRunRecord,
+    RepositoryRecord,
+)
+from repairbot.run_detail import build_run_detail
 from repairbot.tracing import LangSmithTracingConfig
 from repairbot.workflow import WorkflowDependencies
 
@@ -42,6 +50,14 @@ class FakeMongoCollection:
         self.documents.append(
             {"query": query, "document": document, "upsert": upsert}
         )
+
+    async def find_one(self, query, projection=None):
+        del projection
+        for item in reversed(self.documents):
+            document = item["document"]
+            if all(document.get(key) == value for key, value in query.items()):
+                return dict(document)
+        return None
 
 
 class FakeMongoDatabase:
@@ -66,11 +82,11 @@ def test_mongodb_ping_indexes_and_redacted_storage() -> None:
         assert await repository.ping() is True
         names = await repository.ensure_indexes()
         assert names == [spec[3] for spec in MONGODB_INDEX_SPECS]
-        assert len(names) == 17
+        assert len(names) == 19
         assert sum(
             len(collection.indexes)
             for collection in database.collections.values()
-        ) == 17
+        ) == 19
         unique_names = {
             options["name"]
             for collection in database.collections.values()
@@ -98,6 +114,87 @@ def test_mongodb_ping_indexes_and_redacted_storage() -> None:
         assert "db-password" not in stored["test_output"]
         assert "sample-value" not in stored["test_output"]
         assert "<redacted>" in stored["test_output"]
+
+    asyncio.run(scenario())
+
+
+def test_ticket_solution_is_stored_in_full_in_memory_and_mongodb() -> None:
+    async def scenario() -> None:
+        solution = ("Apply the complete reviewed repair step. " * 600) + "FULL-VALUE-END"
+        title = ("Canonical ticket title section " * 20) + "TITLE-END"
+        ticket = JiraTicketMetadata(
+            jira_ticket_id="jira_long_solution",
+            incident_id="inc_long_solution",
+            run_id="run_long_solution",
+            project_key="DEMO",
+            jira_key="DEMO-9876543210",
+            jira_ticket_url="https://jira.local/browse/DEMO-9876543210",
+            title=title,
+            description=("Complete description section. " * 300) + "DESCRIPTION-END",
+            solution=solution,
+        )
+
+        memory = InMemoryRepairPlatformRepository()
+        repository_record = RepositoryRecord(
+            repository_id="repo_long_solution",
+            repo_url="https://github.com/Rkb301/user-service",
+        )
+        upload = LogUploadRecord(
+            uploaded_log_id="log_long_solution",
+            run_id="run_long_solution",
+            original_filename="long.log",
+            storage_path=".workspace/long.log",
+            content_sha256="0" * 64,
+            size_bytes=1,
+        )
+        incident = IncidentRecord(
+            incident_id="inc_long_solution",
+            run_id="run_long_solution",
+            error_name="LongSolutionError",
+            description=ticket.description,
+            proposed_solution=solution,
+            repo_url=repository_record.repo_url,
+            uploaded_log_id=upload.uploaded_log_id,
+        )
+        run = RepairRunRecord(
+            run_id="run_long_solution",
+            repository_id=repository_record.repository_id,
+            incident_id=incident.incident_id,
+            uploaded_log_id=upload.uploaded_log_id,
+            repo_url=repository_record.repo_url,
+            proposed_solution=solution,
+            status="completed",
+        )
+        await memory.create_run_bundle(
+            repository=repository_record,
+            log_upload=upload,
+            incident=incident,
+            run=run,
+        )
+        await memory.save_jira_ticket(ticket)
+        memory_stored = await memory.get_jira_ticket_for_run("run_long_solution")
+        assert memory_stored is not None
+        assert memory_stored.solution == solution
+        assert memory_stored.title == title
+        assert memory_stored.description.endswith("DESCRIPTION-END")
+        detail = await build_run_detail(memory, run)
+        assert detail.jira is not None
+        assert detail.jira.solution == solution
+        assert detail.model_dump()["jira"]["solution"].endswith("FULL-VALUE-END")
+
+        database = FakeMongoDatabase()
+        mongodb = MongoRepairPlatformRepository(database)
+        await mongodb.save_jira_ticket(ticket)
+        document = database.collections["jira_tickets"].documents[0]["document"]
+        assert document["run_id"] == "run_long_solution"
+        assert document["solution"] == solution
+        assert document["title"] == title
+        assert len(document["solution"]) == len(solution)
+        assert document["solution"].endswith("FULL-VALUE-END")
+        assert "solution_preview" not in document
+        queried = await mongodb.get_jira_ticket_for_run("run_long_solution")
+        assert queried is not None
+        assert queried.solution == solution
 
     asyncio.run(scenario())
 
@@ -173,7 +270,7 @@ def test_api_lifespan_initializes_mongodb_and_health_reports_database(
             assert sum(
                 len(collection.indexes)
                 for collection in database.collections.values()
-            ) == 17
+            ) == 19
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://test"

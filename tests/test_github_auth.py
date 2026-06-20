@@ -38,7 +38,7 @@ def test_git_clone_and_push_share_basic_auth_without_secret_in_arguments(
         )
         await client._git(
             tmp_path,
-            ["push", "-u", "origin", "HEAD:refs/heads/ai-fix/test"],
+            ["push", "-u", "origin", "HEAD:refs/heads/bugfix/test"],
             operation="branch push",
         )
         await client.aclose()

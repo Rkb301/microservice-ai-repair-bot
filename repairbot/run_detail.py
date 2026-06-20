@@ -26,15 +26,23 @@ async def build_run_detail(
         raise KeyError(f"Missing incident for run {run.run_id}")
     plan = await repository.get_plan_for_run(run.run_id)
     attempts = await repository.list_attempts(run.run_id)
-    jira = await repository.get_jira_ticket_for_incident(run.incident_id)
-    pull_request = await repository.get_pull_request_for_incident(run.incident_id)
+    jira = await repository.get_jira_ticket_for_run(run.run_id)
+    if jira is None:
+        jira = await repository.get_jira_ticket_for_incident(run.incident_id)
+    pull_request = await repository.get_pull_request_for_run(run.run_id)
+    if pull_request is None:
+        pull_request = await repository.get_pull_request_for_incident(run.incident_id)
     effective_config = run.effective_config
     trace = _trace_metadata(run, effective_config)
     metadata = {
         **project_mvp_metadata(),
         "execution_mode": _execution_mode(run),
         "external_calls_performed": bool(
-            run.allow_network and (run.github_mode == "real" or run.jira_mode == "real")
+            run.openai_api_invoked
+            or (
+                run.allow_network
+                and (run.github_mode == "real" or run.jira_mode == "real")
+            )
         ),
         "dry_run": run.dry_run,
         "repository_id": run.repository_id,
@@ -43,7 +51,21 @@ async def build_run_detail(
         "config_source": run.config_source,
         "effective_config": effective_config,
         "persisted_collections": list(COLLECTION_NAMES),
-        "agent_output_count": 3,
+        "planner_mode": run.planner_mode,
+        "model_provider": run.model_provider,
+        "model_name": run.model_name,
+        "agents_enabled": run.agents_enabled,
+        "agent_count": run.agent_count,
+        "agent_names": run.agent_names,
+        "openai_api_invoked": run.openai_api_invoked,
+        "langchain_used": run.langchain_used,
+        "langgraph_used": run.langgraph_used,
+        "langsmith_enabled": run.langsmith_enabled,
+        "prompt_version": run.prompt_version,
+        "prompt_template_names": run.prompt_template_names,
+        "rendered_agent_inputs": run.rendered_agent_inputs,
+        "structured_agent_outputs": run.agent_outputs,
+        "agent_output_count": len(run.agent_outputs),
     }
     return RunDetail(
         run=run,
@@ -65,71 +87,46 @@ def _agent_outputs(
     plan: PlatformRepairPlan | None,
     attempts: list[RepairAttemptRecord],
 ) -> dict[str, ConceptualAgentOutput]:
-    likely_files = incident.likely_files or ["No source file inferred from the uploaded stack trace"]
+    log_details = run.agent_outputs.get("LogAnalysisAgent", {})
+    planning_details = run.agent_outputs.get("RepairPlanningAgent", {})
+    review_details = run.agent_outputs.get("ReviewPrAgent", {})
     log_analysis = ConceptualAgentOutput(
-        agent_name="Log Analysis Agent",
-        status="completed",
+        agent_name="LogAnalysisAgent",
+        status="completed" if log_details else "pending",
         summary=(
-            f"Parsed {incident.error_name} for "
-            f"{incident.service_name or 'the selected service'}: {incident.description}"
+            str(log_details.get("description"))
+            if log_details
+            else "Log analysis has not completed."
         ),
-        evidence=likely_files,
-        details={
-            "error_name": incident.error_name,
-            "description": incident.description,
-            "affected_service": incident.service_name,
-            "likely_files": incident.likely_files,
-        },
+        evidence=[str(item) for item in log_details.get("direct_evidence", [])],
+        details=log_details,
     )
-    if plan is None:
-        repair_planning = ConceptualAgentOutput(
-            agent_name="Repair Planning Agent",
-            status="pending",
-            summary="Repair planning has not completed.",
-        )
-    else:
-        repair_planning = ConceptualAgentOutput(
-            agent_name="Repair Planning Agent",
-            status="completed",
-            summary=run.proposed_solution or "A repair plan was produced.",
-            evidence=plan.observations,
-            details={
-                "plan_id": plan.plan_id,
-                "hypotheses": plan.hypotheses,
-                "selected_hypothesis": plan.selected_hypothesis,
-                "planned_edits": plan.planned_edits,
-                "planned_tests": plan.planned_tests,
-            },
-        )
-    if not attempts:
-        code_repair = ConceptualAgentOutput(
-            agent_name="Code Repair Agent",
-            status="pending",
-            summary="Code repair is waiting for approval or execution.",
-            details={"branch_name": run.branch_name},
-        )
-    else:
-        latest = attempts[-1]
-        code_repair = ConceptualAgentOutput(
-            agent_name="Code Repair Agent",
-            status="completed" if latest.tests_passed else "failed",
-            summary=latest.patch_summary,
-            evidence=[latest.test_output],
-            details={
-                "attempt_number": latest.attempt_number,
-                "branch_name": run.branch_name,
-                "commit_sha": run.commit_sha,
-                "test_command": latest.test_command,
-                "test_exit_code": latest.test_exit_code,
-                "tests_passed": latest.tests_passed,
-                "changed_files": latest.changed_files,
-                "reflection": latest.reflection,
-            },
-        )
+    repair_planning = ConceptualAgentOutput(
+        agent_name="RepairPlanningAgent",
+        status="completed" if planning_details else "pending",
+        summary=(
+            str(planning_details.get("jira_solution"))
+            if planning_details
+            else "Repair planning has not completed."
+        ),
+        evidence=[str(item) for item in planning_details.get("observations", [])],
+        details=planning_details,
+    )
+    review_pr = ConceptualAgentOutput(
+        agent_name="ReviewPrAgent",
+        status="completed" if review_details else "pending",
+        summary=(
+            str(review_details.get("pr_summary"))
+            if review_details
+            else "Patch and test review has not completed."
+        ),
+        evidence=[str(item) for item in review_details.get("review_checklist", [])],
+        details=review_details,
+    )
     return {
         "log_analysis": log_analysis,
         "repair_planning": repair_planning,
-        "code_repair": code_repair,
+        "review_pr": review_pr,
     }
 
 

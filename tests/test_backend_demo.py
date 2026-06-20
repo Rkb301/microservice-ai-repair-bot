@@ -80,14 +80,14 @@ def test_demo_api_returns_complete_runs_for_all_three_services(tmp_path: Path) -
                 assert set(body["agents"]) == {
                     "log_analysis",
                     "repair_planning",
-                    "code_repair",
+                    "review_pr",
                 }
                 assert {
                     output["agent_name"] for output in body["agents"].values()
                 } == {
-                    "Log Analysis Agent",
-                    "Repair Planning Agent",
-                    "Code Repair Agent",
+                    "LogAnalysisAgent",
+                    "RepairPlanningAgent",
+                    "ReviewPrAgent",
                 }
                 assert all(
                     output["status"] == "completed"
@@ -105,7 +105,7 @@ def test_demo_api_returns_complete_runs_for_all_three_services(tmp_path: Path) -
                 ]
                 assert body["pull_request"]["repo_url"] == DEMO_REPOSITORY_URLS[service]
                 assert body["pull_request"]["base_branch"] == "main"
-                assert body["pull_request"]["branch_name"].startswith("ai-fix/")
+                assert body["pull_request"]["branch_name"].startswith("bugfix/DEMO-")
                 assert body["pull_request"]["title"].startswith("Repair ")
                 assert body["pull_request"]["pull_request_url"] == (
                     f"https://github.local/Rkb301/{service}/pull/1"
@@ -181,7 +181,7 @@ def test_demo_cli_help_and_local_run(tmp_path: Path) -> None:
     assert "status: completed" in result.output
     assert "error name: NullPointerException" in result.output
     assert "proposed solution:" in result.output
-    assert "https://jira.local/browse/DEMO-1001" in result.output
+    assert "https://jira.local/browse/DEMO-" in result.output
     assert "https://github.local/Rkb301/user-service/pull/1" in result.output
     assert "model=openai:gpt-5-mini" in result.output
     assert "langsmith://local-demo/run_" in result.output

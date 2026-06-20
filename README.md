@@ -95,6 +95,7 @@ complete in this pass.
 | Fake GitHub PR | Enabled locally | Deterministic PR metadata |
 | Real GitHub PR | Disabled until explicitly selected and authorized | Real clone, repair branch, controlled commit, push, and REST PR creation |
 | Patch/test execution | Fake for local demos | Reviewed three-service patch adapter and shell-free allowlisted test runner in real mode |
+| OpenAI agents | Heuristic mode by default | Exactly three structured calls when `planner_mode: openai`, `--allow-api`, and `OPENAI_API_KEY` are present |
 | LangSmith | Disabled by default | Configuration and local trace metadata are available; live verification remains optional |
 
 Credentials belong only in environment variables or an ignored local `.env`.
@@ -111,11 +112,30 @@ $env:MONGODB_DB = "repairbot"
 python -m repairbot.cli storage-check
 ```
 
-`storage-check` pings the selected database and initializes 17 named indexes:
-nine unique stable-ID indexes and eight status/run/incident lookup indexes. It
+`storage-check` pings the selected database and initializes 19 named indexes:
+nine unique stable-ID indexes and ten status/run/incident lookup indexes. Ticket
+and pull-request records are indexed by both `incident_id` and `run_id`. It
 prints the database name but never the connection URI. When both variables are
 absent, the command reports the in-memory default. A partial configuration
 fails closed.
+
+Canonical Jira `title`, `description`, and `solution` values are stored in full
+after secret redaction. They are not display previews and are not silently
+shortened. To verify one stored ticket in `mongosh`, select the configured
+database and run:
+
+```javascript
+const runId = "run_replace_me";
+const ticket = db.jira_tickets.findOne(
+  {run_id: runId},
+  {_id: 0, run_id: 1, incident_id: 1, jira_key: 1, title: 1, description: 1, solution: 1}
+);
+printjson({
+  ...ticket,
+  solution_length: ticket?.solution?.length ?? 0,
+  solution_end_excerpt: ticket?.solution?.slice(-200) ?? ""
+});
+```
 
 The API uses MongoDB automatically only when both settings exist. Startup pings
 the database and initializes indexes before serving requests. Check runtime
@@ -195,8 +215,9 @@ python -m repairbot.cli github-check --allow-network --repo-url https://github.c
 ```
 
 Use dry-run first. It clones the repository, verifies a clean workspace, creates
-an `ai-fix/...` branch, applies a reviewed deterministic patch, and runs the
-allowlisted test command. It does not commit, push, or create a PR:
+a `bugfix/<JIRA_KEY>-<service>-<error>` branch, applies a reviewed deterministic
+patch, and runs the allowlisted test command. It does not commit, push, or
+create a PR:
 
 ```powershell
 python -m repairbot.cli repair-run `
@@ -208,6 +229,99 @@ python -m repairbot.cli repair-run `
   --allow-network `
   --dry-run
 ```
+
+Add real Jira to the same real-Git workflow only with explicit credentials,
+network authorization, and a reviewed project key. Jira issue creation happens
+before branch naming; a non-dry successful PR is linked back to that issue:
+
+```powershell
+python -m repairbot.cli repair-run `
+  --log-file examples/demo-logs/user-service-missing-profile.log `
+  --repo-url https://github.com/Rkb301/user-service.git `
+  --service-name user-service `
+  --target-branch demo-bug/user-service-missing-profile `
+  --real-git `
+  --real-jira `
+  --jira-project BGSMFWRJ `
+  --allow-network `
+  --dry-run
+```
+
+`--dry-run` suppresses Git commit, push, and PR creation, but `--real-jira`
+still creates the explicitly requested Jira issue so its key can name the local
+repair branch.
+
+To use the actual three-agent OpenAI path in an otherwise dry repair run, add
+both the planner selection and the separate API allowance. `--allow-network`
+does not authorize model calls:
+
+```powershell
+$env:OPENAI_API_KEY = "<OpenAI key from your secret manager>"
+python -m repairbot.cli repair-run `
+  --log-file examples/demo-logs/user-service-missing-profile.log `
+  --repo-url https://github.com/Rkb301/user-service.git `
+  --service-name user-service `
+  --target-branch demo-bug/user-service-missing-profile `
+  --real-git `
+  --real-jira `
+  --jira-project KAN `
+  --planner-mode openai `
+  --allow-network `
+  --allow-api `
+  --dry-run
+```
+
+This path calls `LogAnalysisAgent`, `RepairPlanningAgent`, and `ReviewPrAgent`
+once each. The selected model analyzes and reviews; the source edit still comes
+only from the reviewed deterministic patch adapter. Unsupported repository
+shapes fail closed or return an already-fixed/no-change result.
+
+### Preparing local demo-bug branches
+
+Main branches may already contain the reviewed fixes. The following commands
+create intentional local bug branches from clean service checkouts. They do not
+push anything. Set `$repairbotRoot` to this repository first:
+
+```powershell
+$repairbotRoot = "C:\path\to\microservice-ai-repair-bot"
+```
+
+Run inside a clean `user-service` checkout:
+
+```powershell
+git switch main
+git pull --ff-only
+git switch -c demo-bug/user-service-missing-profile
+git apply "$repairbotRoot\examples\demo-bug-patches\user-service-missing-profile.patch"
+git add src/main/java/com/example/user/UserServiceApp.java
+git commit -m "demo: restore missing-profile failure"
+```
+
+Run inside a clean `order-service` checkout:
+
+```powershell
+git switch main
+git pull --ff-only
+git switch -c demo-bug/order-service-null-customer
+git apply "$repairbotRoot\examples\demo-bug-patches\order-service-null-customer.patch"
+git add src/main/java/com/example/order/OrderServiceApp.java
+git commit -m "demo: restore null-customer failure"
+```
+
+Run inside a clean `payment-service` checkout:
+
+```powershell
+git switch main
+git pull --ff-only
+git switch -c demo-bug/payment-service-invalid-charge
+git apply "$repairbotRoot\examples\demo-bug-patches\payment-service-invalid-charge.patch"
+git add src/main/java/com/example/payment/PaymentServiceApp.java
+git commit -m "demo: restore invalid-charge failure"
+```
+
+Review each branch and run its failing test before any optional manual push.
+Repair demos should pass the matching `demo-bug/...` value to `--target-branch`.
+The repair bot never creates or pushes these demo branches automatically.
 
 Remove `--dry-run` only when a real branch push and PR are intended:
 
@@ -269,8 +383,9 @@ $env:OPENAI_API_KEY = "<OpenAI key from your secret manager>"
 python -m repairbot.cli ai-planner-check --allow-api
 ```
 
-The command reports only provider/model success. It does not print the API key
-or model response content.
+The command reports the provider/model, confirms one API invocation, confirms
+all three templates rendered, and prints only the bounded parsed check result.
+It does not print the API key or raw provider payload.
 
 The uploaded-log workflow is orchestrated by LangGraph. LangChain provides the
 structured planning and tool-adapter layer, while LangSmith configuration adds
@@ -283,15 +398,17 @@ The MVP is deliberately capped at **four repositories total**: this Python/AI
 orchestrator plus **at most three external microservice repositories**. The
 product-facing example registry is `services.mvp-review.example.yaml`.
 
-The product has exactly three conceptual agents:
+The product has exactly three agents. In `planner_mode: openai`, each is backed
+by one structured call to the configured OpenAI model:
 
-1. **Log Analysis Agent** — turns the uploaded log into a structured incident.
-2. **Repair Planning Agent** — produces the hypothesis, proposed solution, edits, and tests.
-3. **Code Repair Agent** — patches the selected external repo and verifies the change.
+1. **LogAnalysisAgent** — turns a redacted log excerpt into structured evidence.
+2. **RepairPlanningAgent** — produces hypotheses, a selected plan, validation strategy, risks, and Jira-ready solution text.
+3. **ReviewPrAgent** — produces a bounded PR title/summary/checklist and Jira comment from the actual patch and test result.
 
-LangGraph has additional internal workflow nodes, but those nodes are not extra
-agents. The one-model MVP uses **GPT-5 mini** (`openai:gpt-5-mini`) and does not
-perform multi-model voting. A future enterprise design could evaluate five model
+LangGraph still owns clone/config, deterministic patch selection/execution,
+tests, persistence, and finalization; those nodes are not extra agents. The
+one-model MVP uses **GPT-5 mini** (`openai:gpt-5-mini`) and does not perform
+multi-model voting. A future enterprise design could evaluate five model
 candidates and select the best solution; that capability is not implemented.
 
 Jira records contain a title, description, and proposed solution. After a PR is
@@ -320,7 +437,8 @@ fallbacks. Environment variables always remain the only source for credentials.
 Never put API keys, tokens, passwords, private keys, or credential-bearing URLs
 in repository YAML—the loader rejects secret-looking data.
 
-Safe YAML controls the selected allowlisted model, hypothesis/attempt limits,
+Safe YAML controls the selected allowlisted model, agent mode and prompts,
+hypothesis/attempt limits,
 Jira project and issue type, Jira title/description/solution templates, GitHub
 base branch and PR behavior, execution mode, test command,
 build/language/module settings, approval policy, and LangSmith project/tags.
@@ -330,6 +448,29 @@ run without a shell; unit coverage uses only isolated local pytest fixtures.
 The MVP default remains one active model, `openai:gpt-5-mini`. Configuration can
 select another model only when that model is explicitly listed in
 `model.allowed_models`; this does not implement multi-model voting.
+
+The `prompts:` pack has a bounded, non-empty system and human template for each
+agent plus a version and `planner_mode`. Old YAML without this section remains
+valid. Repo-local values override orchestrator defaults. Secret-looking prompt
+content is rejected and rendered values are redacted and bounded before model
+invocation or persistence.
+
+Inspect the effective pack without making any API call:
+
+```powershell
+python -m repairbot.cli prompt-config
+python -m repairbot.cli prompt-config --format json
+python -m repairbot.cli prompt-config --repo-path C:\path\to\service
+python -m repairbot.cli prompt-config --show-rendered-sample
+```
+
+Run records expose the planner mode, provider/model, exact agent names/count,
+whether an OpenAI request was invoked, LangChain/LangGraph/LangSmith flags,
+prompt version/names, bounded redacted rendered inputs, and the three concise
+structured outputs. Local mode reports OpenAI and LangChain as unused rather
+than inferring use from the configured model name. LangSmith is active only
+when YAML enables it, a key exists, and LangSmith tracing is enabled in the
+environment; otherwise the run exposes its local trace reference.
 
 `jira.mode` and `github.mode` are explicit `fake` or `real` settings. Fake mode
 is the local/test default. Real adapters require
@@ -701,7 +842,8 @@ The root `.gitignore` excludes `.env*`, logs, `.repairbot/`, `.workspace/`,
 
 ## Known Limitations
 
-- Agent-backed Java patching still requires LangChain-compatible provider credentials.
+- OpenAI agent mode requires `--allow-api`, `OPENAI_API_KEY`, and an allowlisted `openai:` model; heuristic mode remains network-free.
+- Source patch generation is intentionally not delegated to a model; only the three reviewed Java scenarios are supported.
 - `jira-run` intentionally processes fixes one-by-one and prints fix commands instead of silently mutating multiple repos.
 - Root-cause inference is deterministic and intentionally conservative.
 - Toy services are minimal Java HTTP services, not full Spring Boot apps.

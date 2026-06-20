@@ -20,6 +20,7 @@ from pydantic import (
 )
 
 from .architecture import MVP_MODEL
+from .redaction import redact_sensitive_text
 
 
 PROJECT_CONFIG_NAMES = (
@@ -47,6 +48,30 @@ ALLOWED_TEMPLATE_FIELDS = {
     "repo_url",
     "target_branch",
 }
+PROMPT_TEMPLATE_FIELDS = {
+    "service_name",
+    "log_excerpt",
+    "error_name",
+    "analysis",
+    "repo_url",
+    "target_branch",
+    "build_system",
+    "test_command",
+    "supported_scenarios",
+    "jira_key",
+    "branch_name",
+    "patch_summary",
+    "changed_files",
+    "test_result",
+    "risk_notes",
+    "selected_hypothesis",
+    "planning_output",
+}
+PROMPT_TEMPLATE_NAMES = (
+    "log_analysis_agent",
+    "repair_planning_agent",
+    "review_pr_agent",
+)
 
 
 class ConfigSafetyError(ValueError):
@@ -185,6 +210,63 @@ class LangSmithConfig(BaseModel):
         return cleaned
 
 
+class AgentPromptConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    system: str = Field(min_length=1, max_length=8_000)
+    human: str = Field(min_length=1, max_length=8_000)
+
+    @field_validator("system", "human")
+    @classmethod
+    def non_blank_prompt(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("agent prompt templates must not be blank")
+        _validate_prompt_template(value)
+        return value.strip()
+
+
+class PromptsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(default=1, ge=1, le=1)
+    planner_mode: Literal["heuristic", "openai"] = "heuristic"
+    log_analysis_agent: AgentPromptConfig = Field(
+        default_factory=lambda: AgentPromptConfig(
+            system=(
+                "You are LogAnalysisAgent. Analyze backend service logs using only direct evidence. "
+                "Do not invent facts and do not include secrets."
+            ),
+            human="Service: {service_name}\nLog excerpt:\n{log_excerpt}",
+        )
+    )
+    repair_planning_agent: AgentPromptConfig = Field(
+        default_factory=lambda: AgentPromptConfig(
+            system=(
+                "You are RepairPlanningAgent. Create a small evidence-led Java service repair plan. "
+                "Use only supported scenarios and do not include credentials."
+            ),
+            human=(
+                "Service: {service_name}\nError: {error_name}\nAnalysis: {analysis}\n"
+                "Repository: {repo_url}\nBranch: {target_branch}\nBuild: {build_system}\n"
+                "Test: {test_command}\nSupported scenarios: {supported_scenarios}"
+            ),
+        )
+    )
+    review_pr_agent: AgentPromptConfig = Field(
+        default_factory=lambda: AgentPromptConfig(
+            system=(
+                "You are ReviewPrAgent. Prepare a human-reviewable PR summary and Jira comment. "
+                "Never claim the change is merged."
+            ),
+            human=(
+                "Service: {service_name}\nJira key: {jira_key}\nBranch: {branch_name}\n"
+                "Patch: {patch_summary}\nChanged files: {changed_files}\n"
+                "Test: {test_command}\nResult: {test_result}\nRisks: {risk_notes}"
+                "\nSelected hypothesis: {selected_hypothesis}\nPlan: {planning_output}"
+            ),
+        )
+    )
+
 class RepairBotProjectConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -195,6 +277,7 @@ class RepairBotProjectConfig(BaseModel):
     github: GitHubConfig = Field(default_factory=GitHubConfig)
     repair: RepairBehaviorConfig = Field(default_factory=RepairBehaviorConfig)
     langsmith: LangSmithConfig = Field(default_factory=LangSmithConfig)
+    prompts: PromptsConfig = Field(default_factory=PromptsConfig)
 
     @field_validator("service_name")
     @classmethod
@@ -298,15 +381,35 @@ def validate_test_command(value: str) -> str:
     command = " ".join(value.strip().split())
     if not command:
         raise ValueError("repair.test_command must not be empty")
-    if any(marker in command for marker in (";", "&&", "||", "|", ">", "<", "`", "$(", "\n", "\r")):
+    if any(
+        marker in command
+        for marker in (
+            ";",
+            "&",
+            "||",
+            "|",
+            ">",
+            "<",
+            "`",
+            "$(",
+            "%",
+            "!",
+            "^",
+            "\n",
+            "\r",
+        )
+    ):
         raise ConfigSafetyError("repair.test_command contains shell control operators")
     lowered = command.lower().replace("\\", "/")
     allowed_prefixes = (
         "mvn test",
         "mvn -q test",
+        "mvn.cmd test",
+        "mvn.cmd -q test",
         "./mvnw test",
         "mvnw.cmd test",
         "gradle test",
+        "gradle.bat test",
         "./gradlew test",
         "gradlew.bat test",
         "pytest",
@@ -362,6 +465,8 @@ def _operator_layer(request: BaseModel | Mapping[str, Any] | None) -> dict[str, 
         "language": ("repair", "language"),
         "build_system": ("repair", "build_system"),
         "jira_project": ("jira", "project_key"),
+        "jira_mode": ("jira", "mode"),
+        "planner_mode": ("prompts", "planner_mode"),
     }
     for source, (section, target) in mappings.items():
         if source in raw:
@@ -417,4 +522,26 @@ def _validate_template(template: str) -> None:
                 raise ValueError("Jira templates do not support conversions or format specs")
     except (ValueError, KeyError) as exc:
         raise ValueError("Invalid Jira template") from exc
+
+
+def _validate_prompt_template(template: str) -> None:
+    try:
+        for _, field_name, format_spec, conversion in Formatter().parse(template):
+            if field_name is None:
+                continue
+            if field_name not in PROMPT_TEMPLATE_FIELDS:
+                raise ValueError(f"Unsupported agent prompt field: {field_name}")
+            if format_spec or conversion:
+                raise ValueError("Agent prompts do not support conversions or format specs")
+    except (ValueError, KeyError) as exc:
+        raise ValueError("Invalid agent prompt template") from exc
+
+
+def render_agent_prompt(template: str, values: Mapping[str, Any]) -> str:
+    _validate_prompt_template(template)
+    safe_values = {
+        key: redact_sensitive_text(str(values.get(key) or ""))
+        for key in PROMPT_TEMPLATE_FIELDS
+    }
+    return redact_sensitive_text(template.format_map(safe_values))[:12_000]
 

@@ -32,3 +32,45 @@ langsmith:
   project: microservice-ai-repair-bot
   tags:
     - mvp-review
+prompts:
+  version: 1
+  planner_mode: heuristic
+  log_analysis_agent:
+    system: |
+      You are LogAnalysisAgent. Analyze backend service logs using only direct evidence.
+      Extract the error name, likely files, service hints, and redacted evidence.
+      Do not invent facts. Do not include secrets.
+    human: |
+      Service: {service_name}
+      Log excerpt:
+      {log_excerpt}
+  repair_planning_agent:
+    system: |
+      You are RepairPlanningAgent. Create a small evidence-led Java microservice repair plan.
+      Use only the supported scenarios and deterministic patch boundary.
+      Do not include credentials or raw secrets.
+    human: |
+      Service: {service_name}
+      Error: {error_name}
+      Analysis: {analysis}
+      Repository: {repo_url}
+      Branch: {target_branch}
+      Build system: {build_system}
+      Test command: {test_command}
+      Supported scenarios: {supported_scenarios}
+  review_pr_agent:
+    system: |
+      You are ReviewPrAgent. Prepare a human-reviewable PR summary and Jira comment.
+      Include evidence, changed files, tests, risks, and a review checklist.
+      Never claim the change is merged.
+    human: |
+      Service: {service_name}
+      Jira key: {jira_key}
+      Branch: {branch_name}
+      Patch summary: {patch_summary}
+      Changed files: {changed_files}
+      Test command: {test_command}
+      Test result: {test_result}
+      Risk notes: {risk_notes}
+      Selected hypothesis: {selected_hypothesis}
+      Planning output: {planning_output}

@@ -43,7 +43,7 @@ def test_real_mongodb_round_trip_and_cleanup() -> None:
         incident_id = f"inc_{suffix}"
         try:
             assert await repository.ping() is True
-            assert len(await repository.ensure_indexes()) == 17
+            assert len(await repository.ensure_indexes()) == 19
             repository_record = RepositoryRecord(
                 repository_id=f"repo_{suffix}",
                 repo_url="https://github.com/Rkb301/user-service",
@@ -83,6 +83,7 @@ def test_real_mongodb_round_trip_and_cleanup() -> None:
             ticket = JiraTicketMetadata(
                 jira_ticket_id=f"jira_{suffix}",
                 incident_id=incident_id,
+                run_id=run_id,
                 project_key="DEMO",
                 jira_key=f"DEMO-{int(suffix[:4], 16)}",
                 jira_ticket_url="https://jira.example.com/browse/DEMO-1",
@@ -116,6 +117,7 @@ def test_real_mongodb_round_trip_and_cleanup() -> None:
             pull_request = PullRequestMetadata(
                 pull_request_id=f"pr_{suffix}",
                 incident_id=incident_id,
+                run_id=run_id,
                 repo_url=repository_record.repo_url,
                 branch_name=f"repair/integration-{suffix}",
                 base_branch="main",
@@ -132,6 +134,7 @@ def test_real_mongodb_round_trip_and_cleanup() -> None:
             assert stored_run is not None
             detail = await build_run_detail(repository, stored_run)
             assert detail.jira is not None
+            assert detail.jira.run_id == run_id
             assert detail.jira.pull_request_url == pull_request.pull_request_url
             assert detail.pull_request == pull_request
             assert any(item.run_id == run_id for item in await repository.list_runs())

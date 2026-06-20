@@ -605,6 +605,20 @@ def repair_run(
         bool,
         typer.Option("--real-git", help="Select real clone, patch/test, push, and PR adapters."),
     ] = False,
+    real_jira: Annotated[
+        bool,
+        typer.Option(
+            "--real-jira",
+            help="Create a real Jira issue before branch naming and update it after PR creation.",
+        ),
+    ] = False,
+    jira_project: Annotated[
+        str | None,
+        typer.Option(
+            "--jira-project",
+            help="Jira project key for this run; required for real Jira unless supplied by env or explicit config.",
+        ),
+    ] = None,
     allow_network: Annotated[
         bool,
         typer.Option("--allow-network", help="Required for real GitHub and other configured network adapters."),
@@ -617,6 +631,17 @@ def repair_run(
         Path | None,
         typer.Option("--config", exists=True, dir_okay=False, help="Optional safe YAML defaults file."),
     ] = None,
+    planner_mode: Annotated[
+        str | None,
+        typer.Option(
+            "--planner-mode",
+            help="Planner mode: heuristic (network-free) or openai (exactly three model calls).",
+        ),
+    ] = None,
+    allow_api: Annotated[
+        bool,
+        typer.Option("--allow-api", help="Required when the effective planner mode is openai."),
+    ] = False,
 ) -> None:
     """Run the credential-gated backend repair workflow."""
 
@@ -633,11 +658,43 @@ def repair_run(
         initial_workflow_state,
     )
 
-    RepairBotSettings.from_env()
+    settings = RepairBotSettings.from_env()
+    if planner_mode not in {None, "heuristic", "openai"}:
+        raise typer.BadParameter("--planner-mode must be heuristic or openai")
     if real_git and not allow_network:
         raise typer.BadParameter("--real-git requires --allow-network")
     if real_git and not os.getenv("GITHUB_TOKEN"):
         raise typer.BadParameter("--real-git requires GITHUB_TOKEN in the environment")
+    if real_jira and not real_git:
+        raise typer.BadParameter("--real-jira requires --real-git for a real repair workflow")
+    if real_jira and not allow_network:
+        raise typer.BadParameter("--real-jira requires --allow-network")
+    jira_credentials = ("JIRA_BASE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN")
+    missing_jira = [name for name in jira_credentials if not os.getenv(name)]
+    if real_jira and missing_jira:
+        raise typer.BadParameter(
+            "--real-jira requires environment credentials: " + ", ".join(missing_jira)
+        )
+    explicit_config = load_config_file(config) if config is not None else None
+    configured_jira_project = explicit_config.jira.project_key if explicit_config else None
+    selected_jira_project = (
+        jira_project or os.getenv("JIRA_PROJECT_KEY") or configured_jira_project
+    )
+    if real_jira and not selected_jira_project:
+        raise typer.BadParameter(
+            "--real-jira requires --jira-project, JIRA_PROJECT_KEY, or an explicit config project"
+        )
+    selected_planner_mode = (
+        planner_mode
+        or (explicit_config.prompts.planner_mode if explicit_config else "heuristic")
+    )
+    if selected_planner_mode == "openai" and not allow_api:
+        raise typer.BadParameter("--planner-mode openai requires --allow-api")
+    if selected_planner_mode == "openai" and not os.getenv("OPENAI_API_KEY"):
+        raise typer.BadParameter("--planner-mode openai requires OPENAI_API_KEY")
+    configured_model = explicit_config.model.model if explicit_config else settings.model
+    if selected_planner_mode == "openai" and not configured_model.startswith("openai:"):
+        raise typer.BadParameter("--planner-mode openai requires an openai-prefixed model")
 
     async def execute():
         mongodb_configured = bool(os.getenv("MONGODB_URI") or os.getenv("MONGODB_DB"))
@@ -667,10 +724,14 @@ def repair_run(
                     repo_url=repo_url,
                     repo_branch=target_branch,
                     service_name=service_name,
+                    jira_project=selected_jira_project,
+                    jira_mode="real" if real_jira else None,
                     require_approval=False,
                     github_mode="real" if real_git else "fake",
                     execution_mode="real" if real_git else "fake",
                     allow_network=allow_network,
+                    allow_api=allow_api,
+                    planner_mode=planner_mode,
                     dry_run=dry_run,
                 ),
                 filename=log_file.name,
@@ -706,7 +767,32 @@ def repair_run(
     typer.echo(
         f"tests passed: {latest_attempt.tests_passed if latest_attempt else False}"
     )
+    typer.echo(
+        "patch summary: "
+        f"{redact_sensitive_text(latest_attempt.patch_summary) if latest_attempt else '(not run)'}"
+    )
+    typer.echo(
+        "test command: "
+        f"{redact_sensitive_text(latest_attempt.test_command) if latest_attempt else '(not run)'}"
+    )
+    typer.echo(
+        "resolved executable: "
+        f"{redact_sensitive_text(latest_attempt.resolved_test_executable) if latest_attempt and latest_attempt.resolved_test_executable else '(not available)'}"
+    )
+    typer.echo(
+        "exit code: "
+        f"{latest_attempt.test_exit_code if latest_attempt else '(not run)'}"
+    )
     typer.echo("changed files: " + (", ".join(changed_files) or "(none)"))
+    typer.echo("test output tail:")
+    typer.echo(
+        _last_lines(
+            redact_sensitive_text(latest_attempt.test_output)
+            if latest_attempt
+            else "(no test output)",
+            40,
+        )
+    )
     typer.echo(
         f"Jira URL: {detail.jira.jira_ticket_url if detail.jira else '(none)'}"
     )
@@ -715,8 +801,129 @@ def repair_run(
         f"{detail.pull_request.pull_request_url if detail.pull_request else '(none)'}"
     )
     typer.echo(f"storage mode: {storage_mode}")
+    typer.echo(f"Jira mode: {detail.run.jira_mode}")
     typer.echo(f"model: {detail.run.model_name}")
+    typer.echo(f"planner mode: {detail.run.planner_mode}")
+    typer.echo("agents: " + ", ".join(detail.run.agent_names))
+    typer.echo(f"OpenAI API invoked: {detail.run.openai_api_invoked}")
+    typer.echo(f"LangChain used: {detail.run.langchain_used}")
+    typer.echo(f"LangGraph used: {detail.run.langgraph_used}")
+    typer.echo(f"LangSmith active: {detail.run.langsmith_enabled}")
     typer.echo(f"dry run: {detail.run.dry_run}")
+
+
+@app.command("prompt-config")
+def prompt_config(
+    repo: Annotated[
+        Path | None,
+        typer.Option(
+            "--repo-path",
+            "--repo",
+            exists=True,
+            file_okay=False,
+            help="Optional repository with a prompt override YAML.",
+        ),
+    ] = None,
+    output_format: Annotated[
+        str,
+        typer.Option("--format", help="Output format: text or json."),
+    ] = "text",
+    sample: Annotated[
+        bool,
+        typer.Option(
+            "--show-rendered-sample",
+            "--sample",
+            help="Render safe synthetic inputs through all three templates.",
+        ),
+    ] = False,
+) -> None:
+    """Inspect the effective three-agent prompt pack without making API calls."""
+
+    from .platform_config import (
+        DEFAULT_CONFIG_PATH,
+        PROMPT_TEMPLATE_NAMES,
+        find_project_config_path,
+        load_config_file,
+        merge_effective_config,
+        render_agent_prompt,
+    )
+
+    if output_format not in {"text", "json"}:
+        raise typer.BadParameter("--format must be text or json")
+    default_config = load_config_file(DEFAULT_CONFIG_PATH)
+    repo_path = find_project_config_path(repo) if repo is not None else None
+    repo_config = load_config_file(repo_path) if repo_path is not None else None
+    effective = merge_effective_config(
+        None,
+        repo_config,
+        default_config,
+        RepairBotSettings.from_env(),
+    )
+    prompt_data = effective.prompts.model_dump(mode="json")
+    rendered: dict[str, dict[str, str]] = {}
+    if sample:
+        values = {
+            "service_name": "user-service",
+            "log_excerpt": "NullPointerException at UserService.java:42",
+            "error_name": "NullPointerException",
+            "analysis": '{"observation":"missing profile null guard"}',
+            "repo_url": "https://github.com/example/user-service.git",
+            "target_branch": "main",
+            "build_system": "maven",
+            "test_command": "mvn test",
+            "supported_scenarios": "user-service missing profile null guard",
+            "jira_key": "DEMO-1",
+            "branch_name": "bugfix/DEMO-1-user-service-null-pointer",
+            "patch_summary": "Add the reviewed null guard.",
+            "changed_files": "src/main/java/example/UserService.java",
+            "test_result": "exit_code=0; passed=true",
+            "risk_notes": "Human review remains required.",
+            "selected_hypothesis": "A missing profile crosses the service boundary.",
+            "planning_output": '{"planned_edits":["add reviewed null guard"]}',
+        }
+        for name in PROMPT_TEMPLATE_NAMES:
+            item = getattr(effective.prompts, name)
+            rendered[name] = {
+                "system": render_agent_prompt(item.system, values),
+                "human": render_agent_prompt(item.human, values),
+            }
+    payload = {
+        "planner_mode": effective.prompts.planner_mode,
+        "prompt_version": effective.prompts.version,
+        "model": effective.model.model,
+        "agent_names": [
+            "LogAnalysisAgent",
+            "RepairPlanningAgent",
+            "ReviewPrAgent",
+        ],
+        "prompt_names": list(PROMPT_TEMPLATE_NAMES),
+        "config_precedence": (
+            f"repo:{repo_path.name} > default:{DEFAULT_CONFIG_PATH.name} > environment/fallback"
+            if repo_path
+            else f"default:{DEFAULT_CONFIG_PATH.name} > environment/fallback"
+        ),
+        "prompts": prompt_data,
+        "rendered_samples": rendered,
+        "api_invoked": False,
+        "openai_requires_allow_api": True,
+    }
+    if output_format == "json":
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    typer.echo(f"planner mode: {payload['planner_mode']}")
+    typer.echo(f"model: {payload['model']}")
+    typer.echo(f"prompt version: {payload['prompt_version']}")
+    typer.echo("agent names: " + ", ".join(payload["agent_names"]))
+    typer.echo(f"config precedence: {payload['config_precedence']}")
+    for name in PROMPT_TEMPLATE_NAMES:
+        item = getattr(effective.prompts, name)
+        typer.echo(f"{name}.system: {item.system}")
+        typer.echo(f"{name}.human: {item.human}")
+        if sample:
+            typer.echo(f"{name}.sample.system: {rendered[name]['system']}")
+            typer.echo(f"{name}.sample.human: {rendered[name]['human']}")
+    typer.echo("API invoked: false")
+    typer.echo("real OpenAI calls require --allow-api: true")
 
 
 @app.command("github-check")
@@ -823,11 +1030,20 @@ def ai_planner_check(
 
     settings = RepairBotSettings.from_env()
     try:
-        model_name = asyncio.run(run_planner_check(settings.model))
+        result = asyncio.run(run_planner_check(settings.model))
     except OpenAIPlannerCheckError as exc:
         typer.echo(f"planner check: failed; {redact_sensitive_text(str(exc))}")
         raise typer.Exit(code=1)
-    typer.echo(f"planner check: passed; provider=openai model={model_name}")
+    typer.echo(
+        f"planner check: passed; provider=openai model={result.model_name}"
+    )
+    typer.echo(f"API invoked: {result.api_invoked}")
+    typer.echo(f"prompt templates rendered: {result.rendered_prompt_count}")
+    typer.echo("prompt names: " + ", ".join(result.prompt_names))
+    typer.echo(
+        "parsed response: "
+        + json.dumps(result.parsed_response.model_dump(mode="json"), sort_keys=True)
+    )
 
 
 @app.command("storage-check")
