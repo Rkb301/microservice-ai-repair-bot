@@ -1,5 +1,24 @@
 ﻿# microservice-ai-repair-bot
 
+**AI-assisted incident diagnosis and repair orchestration for three independently deployed Java microservices.**
+
+This is a Python/FastAPI and CLI engineering prototype. It accepts application error logs, identifies possible root causes, builds a reviewable repair plan, exercises a controlled patch-and-test workflow, and records incident, ticket, and pull-request information. The offline demo is reproducible without cloud credentials; real GitHub, Jira, MongoDB, or model integrations are enabled separately and require explicit authorization.
+
+### Four-repository architecture
+
+| Repository | Role |
+| --- | --- |
+| [microservice-ai-repair-bot](https://github.com/Rkb301/microservice-ai-repair-bot) | Python orchestration, API, CLI, analysis, policies, and integration adapters |
+| [user-service](https://github.com/Rkb301/user-service) | Java 17 user/profile HTTP service and regression tests |
+| [order-service](https://github.com/Rkb301/order-service) | Java 17 order service and regression tests |
+| [payment-service](https://github.com/Rkb301/payment-service) | Java 17 payment service and regression tests |
+
+**Current scope:** backend and CLI MVP, not a completed production incident-response platform or polished end-user frontend. Offline/fake integrations do not imply real tickets or PRs were created. The optional model-driven path supports three specialist contributions to a repair decision; credentials and cost controls are required for actual model calls.
+
+### Technical focus
+
+FastAPI · Python · LangGraph · LLM evaluation and orchestration · Java/Maven · GitHub workflows · Jira integration · MongoDB adapters · explicit approval gates · reproducible tests
+
 ## Uploaded-log + external GitHub orchestrator
 
 The Python project is now the repair control plane. A human operator uploads an
