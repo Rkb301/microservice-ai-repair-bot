@@ -12,6 +12,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      NO_COLOR: '1'
+      COLUMNS: '220'
+      TERM: dumb
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
